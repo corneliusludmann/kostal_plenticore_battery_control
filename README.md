@@ -382,3 +382,5 @@ affected. Inverters that do implement register `58` never make this request.
 *   **KSEM Home Consumption Registers:** `40988` / `40990` / `40992` — Home consumption split by source.
 *   **Polling:** All registers are read in a single coordinator cycle every 15 seconds.
 *   **Session keepalive:** Writes are sent at half the configured inverter timeout interval (minimum 5s) to prevent session expiry.
+
+<!-- GitHub connector write-access test: 2026-11-15. -->
