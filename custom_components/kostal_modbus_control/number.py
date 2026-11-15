@@ -465,6 +465,9 @@ class KostalSocLimitNumber(RestoreNumber):
             return
         except Exception as err:
             self._data.mark_communication_lost(f"{self.name}: {err}")
+            # Revoke active sessions before a successful poll can restore
+            # communication, just as a failed coordinator poll does.
+            self._data.notify_connection_lost()
             _LOGGER.warning("%s failed to write register %d: %s", self.name, self._register, err)
             await self._data.handler.close()
 
