@@ -273,6 +273,20 @@ class KostalModbusHandler:
         )
         return result.registers[0]
 
+    async def read_uint16_scale_pair(self, address):
+        """Read a U16 mantissa and adjacent S16 scale in one response.
+
+        These are two independent 16-bit registers, not a word-swapped U32.
+        Return the raw values so callers can expose invalid/missing scaling
+        diagnostically without guessing that the exponent is zero.
+        """
+        result = await self._run_locked_request(
+            f"read uint16 and scale from {address}",
+            lambda: self._safe_read(address, 2),
+        )
+        raw, factor = result.registers
+        return raw, struct.unpack(">h", struct.pack(">H", factor))[0]
+
     async def read_int32(self, address):
         """Reads a signed 32-bit value from two 16-bit registers using configured word order."""
         result = await self._run_locked_request(

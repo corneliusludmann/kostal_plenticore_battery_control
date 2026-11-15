@@ -57,3 +57,13 @@ shutdown. It uses the real coordinator and Modbus locking with an in-memory
 transport; platform unload is mocked successful. No live services are accessed.
 
 Both smoke scripts pass with HA 2026.10.4 and 2026.11.1 on CPython 3.14.10.
+
+## Maximum power and battery identity
+
+`test_power_scaling.py` tests atomic 531/532 decoding in both word orders,
+positive/zero/negative signed scales, sentinel rejection, polling changes,
+invalid-to-valid recovery, unsupported-register recovery, voltage fallback,
+manual override validation/apply/clear, fixed-power clamping and ambiguous model
+IDs. Values such as 100 with exponent 2 are synthetic test cases, not a capture
+of a user's register 532. Real-HA `ha_smoke.py` also checks the new optional
+selector and clearing a saved override. No hardware writes are part of these tests.
