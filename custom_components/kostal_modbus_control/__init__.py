@@ -145,6 +145,8 @@ class KostalCoordinator(DataUpdateCoordinator[dict[Any, Any]]):
             name=DOMAIN,
             update_interval=timedelta(seconds=LOOP_INTERVAL),
         )
+        self._poll_tasks: set[asyncio.Task] = set()
+        self._polling_stopped = False
         self._handler = handler
         self._kostal_data = kostal_data
         # Registers this inverter answered "no such address" for. Not every
@@ -223,7 +225,29 @@ class KostalCoordinator(DataUpdateCoordinator[dict[Any, Any]]):
         _LOGGER.debug("Software version %s read from %s", self._rest_version, url)
         return self._rest_version
 
+    async def async_shutdown(self) -> None:
+        """Stop scheduling and drain polls before either transport is closed."""
+        self._polling_stopped = True
+        await super().async_shutdown()
+        tasks = tuple(self._poll_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _async_update_data(self) -> dict:
+        if self._polling_stopped or self._kostal_data.shutting_down:
+            raise UpdateFailed("Integration is shutting down")
+        # Own the poll task so shutdown cancels only our I/O, rather than the
+        # caller's task (which may also be setting up or refreshing an entry).
+        task = asyncio.create_task(self._async_poll_data())
+        self._poll_tasks.add(task)
+        try:
+            return await task
+        finally:
+            self._poll_tasks.discard(task)
+
+    async def _async_poll_data(self) -> dict:
         poll_started = time.monotonic()
         try:
             # First poll after an outage: re-probe everything. A register refused
@@ -972,6 +996,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data: KostalData = hass.data[DOMAIN][entry.entry_id]
     data.shutting_down = True
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        if data.coordinator is not None:
+            await data.coordinator.async_shutdown()
         hass.data[DOMAIN].pop(entry.entry_id)
         await data.handler.close()
         if data.ksem_handler is not None:
