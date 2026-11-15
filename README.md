@@ -71,6 +71,8 @@ After setup, **Configure** on the integration holds the discharge hold options a
 
 **Discharge hold SOC offset** (0–10%, 0% by default, which leaves the holds as described below) is added on top of every discharge hold's minimum SOC: Predbat's reserve hold (reserve + offset), the Predbat hold in `Charge Start` (`best_charge_limit` + offset), `Block Discharge` and `Hold for car` while `Charge Start` is on (SoC + offset). With the minimum SOC right at the SoC, the SoC the BMS reports can rise one point once the battery stops; the inverter then sees the SoC above the minimum and starts discharging again for a few minutes before it stops. Raising the offset keeps the minimum SOC above that rebound. A minimum SOC above the SoC can make the inverter drop out of FeedIn about every 10 minutes while PV charges the battery, so leave the offset at 0 unless the restarts are a problem.
 
+If a discharge hold would require a minimum above the desired or last acknowledged maximum SoC, the integration automatically uses `1040` instead. This also applies with the option below disabled; the standby-draw limitation still applies. Register transitions establish the new hold before releasing the previous one.
+
 **Hold through the discharge limit (1040)** (off by default) makes all of those holds block `1040` instead of writing the minimum SOC (`1042`). `Block Discharge` and `Hold for car` while `Charge Start` is on write `1040 = 0` for as long as they are active. The Predbat reserve hold writes it once the SoC is at or below the reserve + offset, and the Predbat hold in `Charge Start` once the SoC is at or below `best_charge_limit + 1%` + offset. They write the battery's maximum back when the SoC is above that or the hold ends. If `1040` is still blocked when the battery is charged, or `Discharge Start` or `Inverter Control` runs, it is written back then, in either setting. The inverter keeps running and does not drop out of FeedIn, but its own standby draw (typically around 170–260 W) still comes from the battery. Wherever the sections below describe a hold through the minimum SOC, this option replaces it with `1040`.
 
 ## Entities Explained
@@ -97,7 +99,7 @@ Control writes require a successful, sufficiently recent battery poll and Modbus
 
 **Automatic recovery is disabled by default.** A failed control requires a new explicit start. If enabled in Options, recovery resumes only a still-valid session and honours the settling delay (`Modbus timeout + 15s`). A Charge Start session always expires after the configured maximum duration, including startup waits and time spent disconnected; recovery never extends this deadline. A completed Stop drains active writers before returning. The inverter may still take its timeout to return to internal control.
 
-Options provide a maximum measurement age (default 60 seconds) and a Charge Start duration (default 60 minutes). Changing the duration applies to the next session, not an already running deadline. Charge Start and Inverter Control are not restored as active on HA restart. The SoC number entities still restore valid limits, after validating the enabled pair together. A target SoC is an inverter limit, not an automatic end to the Charge Start session; use an HA automation to end the session at the desired target when needed.
+Options provide a maximum measurement age (default 60 seconds) and a Charge Start duration (default 60 minutes). Changing the duration applies to the next session, not an already running deadline. Charge Start and Inverter Control are not restored as active on HA restart. The non-writing EMS protection monitor retains its enabled state and blocks charging until fresh inputs establish a limit. Setup/reload starts a write pause of the configured inverter timeout plus 15 seconds, so restored SoC keepalives cannot prolong an old power command. The SoC number entities still restore valid limits, after validating the enabled pair together. Releasing an inactive SoC limit during an outage remains pending and retries when communication and settling permit it (`release_pending` attribute). A target SoC is an inverter limit, not an automatic end to the Charge Start session; use an HA automation to end the session at the desired target when needed.
 
 ### Predbat Control
 
@@ -118,6 +120,8 @@ Two Predbat features are followed automatically:
 *   **Hold for car** — when `predbat.status` contains `Hold for car` without an active charge window, the decision is forced to hold so the battery does not discharge into the car charger.
 *   **Low power charging** — when `switch.predbat_set_charge_low_power` is on, the charge power is capped to `input_number.predbat_charge_rate`, which is used directly in Watts. If the house then exports at least 100W to the grid for 30 seconds straight, the charge setpoint writes are suspended entirely, letting the inverter's own faster zero-export regulation take over. Writes resume as soon as the measured battery charging power falls more than 5% below the low-power setpoint (15% on a BI, whose AC setpoint includes conversion loss), for example when PV production fades.
 
+If a previously observed Predbat mode disappears or becomes unavailable, or its active charge target is invalid, Charge Start stops writing instead of falling back to manual charging. The configured recovery policy applies.
+
 ### EMS Grid Protection
 
 The EMS (Energy Management System) switch protects your house fuses during forced battery charging.
@@ -127,7 +131,7 @@ The EMS (Energy Management System) switch protects your house fuses during force
 - It calculates the available headroom per phase: `(fuse_size × 90%) - |phase_current|` converted to Watts at that phase's measured voltage (230V when the meter reports none).
 - Charge power is set to the most constrained phase's headroom, capped by your configured "Set Charge Rate". The limit is shown in Watts by the `EMS Charge Limit` sensor.
 - If any phase is already at 90% of fuse capacity, charging is reduced accordingly. If headroom is zero or negative, charging stops (0W).
-- The computed limit is smoothed with an exponential moving average so it does not jump on a single noisy reading.
+- The ceiling uses measured battery power and the most constrained phase, including the extra grid demand when discharge ends. Increases are smoothed; decreases apply immediately and are checked again before a queued charge command is sent.
 
 **Requirements:**
 - A supported smart meter must be connected to the inverter (detected automatically via register 1082).
@@ -226,7 +230,7 @@ setpoint run out and returns to internal control, and the limits lapse briefly b
 again. A limit set back to "not in use" during that wait is sent once the wait is over.
 
 The `Battery Minimum SOC` / `Battery Maximum SOC` diagnostic sensors read the registers back if you
-want to watch this happen. Each limit entity also exposes `active` and `writing` attributes.
+want to watch this happen. Each limit entity also exposes `active`, `writing` and `release_pending` attributes.
 
 ### Sensors (Read-Only)
 
@@ -347,7 +351,7 @@ recorded as unavailable, an informational line is logged once, that register is 
 the integration runs, and every other entity keeps updating. Timeouts and dropped connections are
 unchanged — those still mark communication lost and trigger the automatic resume above.
 
-The one exception is register `58`. Where it is missing, the `Software Version` sensor falls back to
+The one exception is register `58`. If **Local HTTP firmware fallback** is enabled in Options (off by default), the `Software Version` sensor falls back to
 the inverter's web API, `http://<inverter>/api/v1/info/version`, which reports the same UI version
 without logging in. It is fetched when the integration starts and again after every communication
 outage — a firmware update restarts the inverter, so a new version is picked up by itself. If the web
@@ -383,3 +387,4 @@ affected. Inverters that do implement register `58` never make this request.
 *   **KSEM Home Consumption Registers:** `40988` / `40990` / `40992` — Home consumption split by source.
 *   **Polling:** All registers are read in a single coordinator cycle every 15 seconds.
 *   **Session keepalive:** Writes are sent at half the configured inverter timeout interval (minimum 5s) to prevent session expiry.
+

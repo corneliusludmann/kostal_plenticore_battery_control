@@ -262,6 +262,7 @@ class KostalSocLimitNumber(RestoreNumber):
         self._attr_unique_id = f"{entry_id}_{self._key}"
         self._attr_native_value = self._inactive_value
         self._removed = False
+        self._release_pending = False
         self._remove_timer = None
         self._write_task = None
         self._active_write_tasks: set[asyncio.Task] = set()
@@ -279,6 +280,7 @@ class KostalSocLimitNumber(RestoreNumber):
         return {
             "active": self._is_active(),
             "writing": self._remove_timer is not None,
+            "release_pending": self._release_pending,
         }
 
     async def async_added_to_hass(self) -> None:
@@ -324,24 +326,9 @@ class KostalSocLimitNumber(RestoreNumber):
         await super().async_will_remove_from_hass()
 
     async def async_set_native_value(self, value: float) -> None:
-        self._attr_native_value = self._validate_value(value)
-        self._data.soc_limits_valid = True
-        self._store_value(self._attr_native_value)
-        self._apply()
-        self.async_write_ha_state()
-        pending = self._write_task
-        if pending is not None and not pending.done():
-            # A keep-alive write already in flight captured the previous value,
-            # so let it land before writing the new one — the other order would
-            # undo the change until the next tick, or for good on a release
-            try:
-                await pending
-            except Exception:  # already logged and handled inside the write
-                pass
-        # Awaited rather than scheduled so a value change is never dropped
-        # behind an in-flight keep-alive write. This is also the one-shot
-        # release write when the limit was just set back to its inactive value.
-        await self._async_write_limit()
+        # Apply desired state and its writes under the same lock. A queued hold
+        # must not see a higher maximum before register 1044 has been raised.
+        await self._async_write_limit(new_value=float(value))
 
     def _validate_value(self, value: float) -> float:
         """Reject invalid pairs before mutating state or issuing any write."""
@@ -366,7 +353,7 @@ class KostalSocLimitNumber(RestoreNumber):
     @callback
     def _apply(self) -> None:
         """Bring the keep-alive write loop in line with the current value."""
-        if self._is_active():
+        if self._is_active() or self._release_pending:
             self._start_timer()
         else:
             self._cancel_timer()
@@ -400,12 +387,19 @@ class KostalSocLimitNumber(RestoreNumber):
     async def _async_write_tick(self, *args) -> None:
         await self._async_write_limit()
 
-    async def _async_write_limit(self) -> None:
+    async def _async_write_limit(self, *, new_value: float | None = None) -> None:
         task = asyncio.current_task()
         self._active_write_tasks.add(task)
         try:
             # Serialize the final safety check with stop and all other writers.
             async with self._data.control_lock:
+                if new_value is not None:
+                    self._attr_native_value = self._validate_value(new_value)
+                    self._data.soc_limits_valid = True
+                    self._store_value(self._attr_native_value)
+                    self._release_pending = not self._is_active()
+                    self._apply()
+                    self.async_write_ha_state()
                 if not self._write_allowed():
                     return
                 token = CONTROL_WRITE_GUARD.set(
@@ -442,7 +436,28 @@ class KostalSocLimitNumber(RestoreNumber):
                 )
             return
         try:
+            hold = self._data.discharge_hold_min_soc
+            changing_max = self._data_attr == "max_soc" and hold is not None
+            if self._data_attr == "min_soc" and self._register_value(float(value)) > self._data.applied_max_soc:
+                return  # Retry after the maximum's pending write is acknowledged.
+            if changing_max and self._data.hold_uses_discharge_limit():
+                # Establish 1040 before lowering 1044 below an existing hold.
+                await self._data.async_write_discharge_hold(hold)
+            elif self._data_attr == "max_soc" and value < self._data.applied_max_soc:
+                # Retire an older, higher minimum before lowering the maximum.
+                await self._data.handler.write_float(REG_BATTERY_MIN_SOC, self._data.effective_min_soc())
             await self._data.handler.write_float(self._register, self._register_value(float(value)))
+            if self._data_attr == "max_soc":
+                self._data.applied_max_soc = float(value)
+            if changing_max and not self._data.hold_uses_discharge_limit():
+                await self._data.async_write_discharge_hold(hold)
+            if value == self._attr_native_value and not self._is_active():
+                self._release_pending = False
+                self._cancel_timer()
+                if self._remove_deferred_write is not None:
+                    self._remove_deferred_write()
+                    self._remove_deferred_write = None
+                self.async_write_ha_state()
         except KostalModbusWriteAborted:
             return
         except Exception as err:

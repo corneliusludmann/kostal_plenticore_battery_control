@@ -13,3 +13,17 @@ Before deployment, validate setup/reload/unload in a disposable HA instance and
 then a supervised low-power charge/stop, disconnect/reconnect, expiration and
 stale-source scenario on the supported inverter. Publish coverage as a measured
 property, not a claim that the complete pre-existing integration is covered.
+
+
+## Real Home Assistant smoke test
+
+In a separate CPython 3.14 virtual environment, install
+`homeassistant==2026.11.1 pymodbus`, then run `python tools/ha_smoke.py` from the
+repository root. Independently verified with CPython 3.14.10. The script sits
+outside this directory so `conftest.py` cannot substitute the framework.
+
+It checks the actual HA form serializer and actual EntityComponent/RestoreNumber
+restore and removal hooks, startup write suppression, post-settle writes and
+timer/task cleanup. Modbus is mocked and standalone entities omit device
+association. It does not certify full integration setup/reload, device registry
+association, real-time timer dispatch or physical inverter timeout behavior.

@@ -185,6 +185,7 @@ class KostalBaseSwitch(SwitchEntity):
         self._cancel_deadline()
         await self._drain_start_task()
         async with self._data.control_lock:
+            self._clear_local_control_state()
             self._data.last_stop_time = time.time()
 
     @property
@@ -280,6 +281,7 @@ class KostalBaseSwitch(SwitchEntity):
             self._set_resume_pending(True)
         elif not self._keep_enabled_on_fault:
             self._attr_is_on = False
+            self._clear_local_control_state()
             self._set_resume_pending(False)
             self._cancel_deadline()
         if not self._keep_enabled_on_fault:
@@ -340,6 +342,8 @@ class KostalBaseSwitch(SwitchEntity):
                     await asyncio.wait_for(action(*args), timeout=self._action_timeout)
                 finally:
                     CONTROL_WRITE_GUARD.reset(token)
+                    if not self._attr_is_on:
+                        self._clear_local_control_state()
             return True
         except asyncio.CancelledError:
             raise
@@ -349,6 +353,7 @@ class KostalBaseSwitch(SwitchEntity):
 
     async def _handle_runtime_fault(self, err: Exception, phase: str) -> None:
         if not self._attr_is_on:
+            self._clear_local_control_state()
             return
 
         self._cancel_loop_timer()
@@ -388,6 +393,7 @@ class KostalBaseSwitch(SwitchEntity):
             self._write_activity(f"turned off after {phase} failure")
 
         if not self._attr_is_on:
+            self._clear_local_control_state()
             self._cancel_deadline()
         await self._data.handler.close()
         self.async_write_ha_state()
@@ -395,20 +401,34 @@ class KostalBaseSwitch(SwitchEntity):
     def _on_communication_fault(self) -> None:
         """Hook for subclasses that need to clear transient runtime state."""
 
+    def _clear_local_control_state(self) -> None:
+        """Retire this writer's intent even when transport cleanup is impossible."""
+        if self._data.discharge_hold_owner == self._key:
+            self._data.discharge_hold_min_soc = None
+            self._data.discharge_hold_owner = None
+
     async def _async_handle_loop_tick(self, *args) -> None:
         if not self._attr_is_on:
             return
         await self._run_guarded_action(self._loop_action, "periodic loop", *args)
 
     async def _run_stop_action(self) -> None:
+        # Stop has already revoked is_on, so it needs its own transport guard.
+        token = CONTROL_WRITE_GUARD.set(
+            lambda: not self._removed and self._data.control_data_fresh()
+        )
         try:
             await asyncio.wait_for(self._stop_action(), timeout=self._action_timeout)
         except asyncio.CancelledError:
             raise
+        except KostalModbusWriteAborted:
+            pass  # Revoked while waiting for the transport; let commands expire.
         except Exception as err:
             self._data.mark_communication_lost(f"{self.name}: {err}")
             _LOGGER.warning("%s stop action failed: %s", self.name, err)
             await self._data.handler.close()
+        finally:
+            CONTROL_WRITE_GUARD.reset(token)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         async with self._data.transition_lock:
@@ -479,11 +499,14 @@ class KostalBaseSwitch(SwitchEntity):
         self._set_resume_pending(False)
         await self._drain_start_task()
         async with self._data.control_lock:
-            if was_on:
-                try:
+            had_hold = self._data.discharge_hold_owner == self._key
+            try:
+                if was_on:
                     if self._data.control_data_fresh():
                         await self._run_stop_action()
-                finally:
+            finally:
+                self._clear_local_control_state()
+                if was_on or had_hold:
                     # Timestamp after the final write, not before waiting for a busy transport.
                     if not self._keep_enabled_on_fault:
                         self._data.last_stop_time = time.time()
@@ -505,6 +528,7 @@ class KostalBaseSwitch(SwitchEntity):
 
     async def _hold_discharge_at(self, soc_percent: float) -> None:
         """Stop discharging at soc_percent — see KostalData.async_write_discharge_hold."""
+        self._data.discharge_hold_owner = self._key
         await self._data.async_write_discharge_hold(soc_percent)
 
     async def _release_discharge_hold(self) -> None:
@@ -513,11 +537,14 @@ class KostalBaseSwitch(SwitchEntity):
         One write so the release takes effect at once; the min SOC number keeps
         writing its own limit if one is set.
         """
-        self._data.discharge_hold_min_soc = None
-        if self._data.hold_use_discharge_limit:
-            await self._data.async_restore_discharge_limit()
+        if self._data.discharge_hold_owner not in (None, self._key):
             return
-        await self._data.handler.write_float(REG_BATTERY_MIN_SOC, self._data.effective_min_soc())
+        self._data.discharge_hold_min_soc = None
+        self._data.discharge_hold_owner = None
+        await self._data.async_restore_discharge_limit()
+        minimum = self._data.effective_min_soc()
+        if minimum <= self._data.applied_max_soc:
+            await self._data.handler.write_float(REG_BATTERY_MIN_SOC, minimum)
 
     async def _write_power_setpoint(self, watts: float) -> None:
         """Write a signed battery power setpoint in Watts (negative = charge).
@@ -612,6 +639,47 @@ class KostalChargeStartSwitch(KostalBaseSwitch):
         self._predbat_low_power_export_since: float | None = None
         self._reserve_holding: bool = False
         self._reserve_hold_lock = asyncio.Lock()
+        self._predbat_expected = False
+
+    def _predbat_inputs_valid(self) -> bool:
+        """Remember a configured Predbat source throughout this charge session."""
+        state = self.hass.states.get(PREDBAT_MODE_ENTITY)
+        if state is None:
+            return not self._predbat_expected
+        self._predbat_expected = True
+        if state.state in {"unknown", "unavailable", "none", "None", ""}:
+            return False
+        return state.state not in PREDBAT_ACTIVE_MODES or self._predbat_best_charge_limit() is not None
+
+    def _write_allowed(self) -> bool:
+        return super()._write_allowed() and self._predbat_inputs_valid()
+
+    async def _write_power_setpoint(self, watts: float) -> None:
+        # A new poll can lower EMS headroom while this command waits for I/O.
+        guard = CONTROL_WRITE_GUARD.get()
+        def allowed() -> bool:
+            monitor = self._data.runtime_switches.get(SWITCH_EMS)
+            return ((guard is None or guard()) and (
+                watts >= 0 or monitor is None or not monitor.is_on
+                or abs(watts) <= self._charge_target_watts()
+            ))
+        token = CONTROL_WRITE_GUARD.set(allowed)
+        try:
+            await super()._write_power_setpoint(watts)
+        finally:
+            CONTROL_WRITE_GUARD.reset(token)
+
+    def _clear_local_control_state(self) -> None:
+        super()._clear_local_control_state()
+        self._predbat_was_charging = None
+        self._predbat_discharge_blocked = False
+        self._predbat_startup_block_until = None
+        self._predbat_low_power_capping = False
+        self._predbat_low_power_suspended = False
+        self._predbat_low_power_export_since = None
+        self._predbat_expected = False
+        self._reserve_holding = False
+        self._set_predbat_status("Inactive")
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -922,7 +990,7 @@ class KostalChargeStartSwitch(KostalBaseSwitch):
             return None
         try:
             value = float(state.state)
-            return value if math.isfinite(value) else None
+            return value if math.isfinite(value) and 0 <= value <= 100 else None
         except (ValueError, TypeError):
             return None
 
@@ -1075,6 +1143,8 @@ class KostalChargeStartSwitch(KostalBaseSwitch):
         if not self._attr_is_on:
             self._set_predbat_status("Inactive")
             return
+        if not self._predbat_inputs_valid():
+            raise KostalModbusWriteAborted("Predbat control inputs are unavailable")
         if self._is_predbat_active():
             await self._predbat_loop_action()
         else:
@@ -1106,7 +1176,7 @@ class KostalChargeStartSwitch(KostalBaseSwitch):
             limit = self._data.ems_charge_limit_w
             if limit is None or not math.isfinite(limit):
                 return 0.0
-            target_watts = min(target_watts, max(0.0, limit))
+            target_watts = min(target_watts, max(0.0, limit), monitor.safe_charge_limit_watts())
         return target_watts
 
     async def _predbat_loop_action(self) -> None:
@@ -1123,8 +1193,7 @@ class KostalChargeStartSwitch(KostalBaseSwitch):
                 charge_start_limit,
                 hold_limit,
             )
-            self._set_predbat_status("Waiting")
-            return
+            raise KostalModbusWriteAborted("Predbat charge target is unavailable")
         assert soc is not None and hold_limit is not None
 
         if self._predbat_car_hold_active():
@@ -1365,8 +1434,11 @@ class KostalEMSSwitch(KostalBaseSwitch, RestoreEntity):
     async def async_added_to_hass(self) -> None:
         """Restore on/off state after HA restart."""
         last = await self.async_get_last_state()
-        # Control requires a new explicit start after a Home Assistant restart.
-        self._attr_is_on = False
+        # This is a non-writing protection monitor, not an active charge session.
+        self._attr_is_on = last is not None and last.state == "on"
+        self._data.ems_charge_limit_w = None
+        if self._attr_is_on:
+            self._schedule_start_loop("restore protection")
 
         self.async_write_ha_state()
 
@@ -1429,8 +1501,38 @@ class KostalEMSSwitch(KostalBaseSwitch, RestoreEntity):
             _LOGGER.warning("EMS: Phase current unavailable — blocking charge until fresh readings recover")
             return
 
-        fuse_size = self._data.fuse_size
-        safe_limit_amps = fuse_size * EMS_SAFETY_MARGIN
+        charge_rate_watts = abs(self._data.charge_power_w())
+        raw_watts = self.safe_charge_limit_watts()
+
+        # Decreases enforce the physical headroom immediately. Only increases
+        # are smoothed; the requested limit is never a proxy for actual power.
+        EMA_ALPHA = 0.3
+        if self._ems_smoothed_limit is None or raw_watts <= self._ems_smoothed_limit:
+            self._ems_smoothed_limit = raw_watts
+        else:
+            self._ems_smoothed_limit += EMA_ALPHA * (raw_watts - self._ems_smoothed_limit)
+        target_watts = float(math.floor(self._ems_smoothed_limit))
+        if target_watts <= 0.0:
+            new_status = "Blocked"
+        elif target_watts < charge_rate_watts - POWER_RATE_STEP_W:
+            new_status = "Protecting"
+        else:
+            new_status = "Ok"
+        self._data.ems_charge_limit_w = target_watts
+        self._set_ems_status(new_status)
+
+    def safe_charge_limit_watts(self) -> float:
+        """Absolute charge ceiling from measured power and worst phase headroom."""
+        coordinator = self._data.coordinator
+        data = coordinator.data if coordinator is not None else None
+        if not data or not self._data.control_data_fresh():
+            return 0.0
+        phases = [data.get(reg) for reg in (REG_CURRENT_PHASE1, REG_CURRENT_PHASE2, REG_CURRENT_PHASE3)]
+        battery_power = data.get(REG_BATTERY_POWER)
+        if (not all(isinstance(v, (int, float)) and math.isfinite(v) and v >= 0 for v in phases)
+                or not isinstance(battery_power, (int, float)) or not math.isfinite(battery_power)):
+            return 0.0
+        safe_limit_amps = self._data.fuse_size * EMS_SAFETY_MARGIN
         voltages = [
             self._phase_voltage(data.get(address))
             for address in (REG_VOLTAGE_PHASE1, REG_VOLTAGE_PHASE2, REG_VOLTAGE_PHASE3)
@@ -1439,51 +1541,26 @@ class KostalEMSSwitch(KostalBaseSwitch, RestoreEntity):
         # Battery charging is spread evenly over the three phases, so each
         # phase allows its own current headroom times three at its voltage
         headroom_watts = min(
-            (safe_limit_amps - max(0.0, phase1)) * 3 * voltages[0],
-            (safe_limit_amps - max(0.0, phase2)) * 3 * voltages[1],
-            (safe_limit_amps - max(0.0, phase3)) * 3 * voltages[2],
+            (safe_limit_amps - phase) * 3 * voltage
+            for phase, voltage in zip(phases, voltages)
         )
-
-        charge_rate_watts = abs(self._data.charge_power_w())
-        prev_limit = self._ems_smoothed_limit if self._ems_smoothed_limit is not None else charge_rate_watts
-        raw_watts = max(0.0, min(prev_limit + headroom_watts, charge_rate_watts))
-
-        EMA_ALPHA = 0.3
-        if self._ems_smoothed_limit is None:
-            self._ems_smoothed_limit = raw_watts
-        else:
-            self._ems_smoothed_limit = EMA_ALPHA * raw_watts + (1 - EMA_ALPHA) * self._ems_smoothed_limit
-
-        target_watts = float(round(self._ems_smoothed_limit))
-
-        if target_watts <= 0.0:
-            new_status = "Blocked"
-        elif target_watts < charge_rate_watts - POWER_RATE_STEP_W:
-            # A margin keeps small moves of a rate that follows the battery
-            # voltage from reading as protection
-            new_status = "Protecting"
-        else:
-            new_status = "Ok"
-
-        _LOGGER.debug(
-            "EMS: phase=%.1f/%.1f/%.1f A at %.0f/%.0f/%.0f V, fuse=%sA, headroom=%.0f W, charge_rate=%.0f W → raw=%.0f W smooth=%.0f W (%s)",
-            phase1, phase2, phase3, *voltages, fuse_size,
-            headroom_watts, charge_rate_watts,
-            raw_watts, target_watts, new_status,
-        )
-
-        self._data.ems_charge_limit_w = target_watts
-        self._set_ems_status(new_status)
-        # EMS does NOT write to Modbus — Charge Start is the sole writer to the power setpoint
+        # Ending an existing discharge also consumes grid headroom. Keep the
+        # battery contribution signed rather than treating discharge as zero.
+        return float(math.floor(max(0.0, min(-battery_power + headroom_watts, abs(self._data.charge_power_w())))))
 
     @staticmethod
     def _phase_voltage(voltage: float | None) -> float:
         """Measured phase voltage, or the nominal voltage when the meter reports none."""
-        if voltage is None or voltage < 100.0:
+        if voltage is None or not math.isfinite(voltage) or voltage < 100.0:
             return EMS_PHASE_VOLTAGE
         return voltage
 
     async def _stop_action(self) -> None:
+        self._clear_local_control_state()
+        # EMS does NOT write to Modbus.
+
+    def _clear_local_control_state(self) -> None:
+        super()._clear_local_control_state()
         self._ems_smoothed_limit = None
         self._data.ems_charge_limit_w = None
         self._set_ems_status("Inactive")
@@ -1491,6 +1568,7 @@ class KostalEMSSwitch(KostalBaseSwitch, RestoreEntity):
 
     def _on_communication_fault(self) -> None:
         self._ems_smoothed_limit = None
+        self._data.ems_charge_limit_w = None
 
 
 class KostalInverterControlSwitch(KostalBaseSwitch, RestoreEntity):
