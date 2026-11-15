@@ -31,8 +31,9 @@ from homeassistant.helpers import (
 )
 from homeassistant.helpers.config_validation import custom_serializer
 from homeassistant.helpers.entity_component import EntityComponent
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from custom_components.kostal_modbus_control import KostalData, number
+from custom_components.kostal_modbus_control import KostalData, number, sensor
 from custom_components.kostal_modbus_control.config_flow import ConfigFlow
 
 
@@ -106,6 +107,42 @@ async def smoke(config_dir: str) -> None:
     assert all(entity._removed and entity._remove_timer is None for entity in entities)
     assert all(not entity._active_write_tasks for entity in entities)
     print("PASS: post-settle limit writes and real entity removal/timer cleanup")
+
+    coordinator = DataUpdateCoordinator(
+        hass, logging.getLogger(__name__), name="hold smoke", config_entry=None,
+    )
+    coordinator.async_set_updated_data({1040: 6000, 1042: 20})
+    data.coordinator = coordinator
+    diagnostic = sensor.KostalDischargeHoldModeSensor(coordinator, data, "smoke")
+    diagnostic.entity_id = "sensor.discharge_hold_mode"
+    diagnostic._attr_unique_id = None
+    sensors = EntityComponent(logging.getLogger(__name__), "sensor", hass)
+    with patch.object(
+        sensor.KostalBaseSensor, "device_info",
+        new_callable=PropertyMock, return_value=None,
+    ):
+        await sensors.async_add_entities([diagnostic])
+    assert coordinator._listeners
+    state = hass.states.get(diagnostic.entity_id)
+    assert state.state == "inactive"
+    assert state.attributes["device_class"] == "enum"
+    assert state.attributes["options"] == ["inactive", "minimum_soc", "discharge_limit"]
+    data.discharge_hold_min_soc = 90
+    coordinator.async_set_updated_data({1040: 0, 1042: 20})
+    state = hass.states.get(diagnostic.entity_id)
+    assert state.state == "discharge_limit"
+    assert state.attributes["automatic_fallback"]
+    assert state.attributes["reason"] == "above_requested_max_soc"
+    assert state.attributes["observed_discharge_limit_w"] == 0
+    data.communication_ok = False
+    coordinator.async_set_update_error(ConnectionError("smoke outage"))
+    state = hass.states.get(diagnostic.entity_id)
+    assert state.state == "discharge_limit"
+    assert state.attributes["observed_discharge_limit_w"] is None
+    assert not state.attributes["control_ready"]
+    await diagnostic.async_remove()
+    assert not coordinator._listeners
+    print("PASS: real enum sensor updates, outage diagnostics and listener cleanup")
     await hass.async_stop(force=True)
 
 

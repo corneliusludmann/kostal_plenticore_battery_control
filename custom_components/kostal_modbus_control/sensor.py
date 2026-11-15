@@ -179,6 +179,7 @@ async def async_setup_entry(
         KostalEMSChargeLimitSensor(data, entry.entry_id),
         KostalPredbatStatusSensor(data, entry.entry_id),
         KostalPredbatModeSensor(data, entry.entry_id),
+        KostalDischargeHoldModeSensor(coordinator, data, entry.entry_id),
         # Diagnostic sensors (disabled by default)
         KostalInverterStateSensor(coordinator, entry.entry_id),
         KostalInverterStateTextSensor(coordinator, entry.entry_id),
@@ -267,6 +268,63 @@ class KostalBaseSensor(CoordinatorEntity[KostalCoordinator], SensorEntity):
     @property
     def available(self) -> bool:
         return self.coordinator.last_update_success and self.coordinator.data is not None
+
+class KostalDischargeHoldModeSensor(KostalBaseSensor):
+    """Selected local hold method; not confirmation of physical discharge blocking."""
+
+    _key = "discharge_hold_mode"
+    _name = "Discharge Hold Mode"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["inactive", "minimum_soc", "discharge_limit"]
+    _attr_icon = "mdi:battery-lock"
+
+    def __init__(self, coordinator, data, entry_id):
+        super().__init__(coordinator, entry_id)
+        self._data = data
+
+    @property
+    def available(self) -> bool:
+        # Local intent remains useful during an outage. Register observations
+        # below are withheld unless the current poll is usable for control.
+        return True
+
+    @property
+    def native_value(self) -> str:
+        if self._data.discharge_hold_min_soc is None:
+            return "inactive"
+        return "discharge_limit" if self._data.hold_uses_discharge_limit() else "minimum_soc"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self._data
+        mode = self.native_value
+        reason = "no_hold"
+        if mode != "inactive":
+            if data.hold_use_discharge_limit:
+                reason = "configured_discharge_limit"
+            elif mode == "minimum_soc":
+                reason = "minimum_soc_hold"
+            elif max(data.min_soc, data.discharge_hold_min_soc) > data.max_soc:
+                reason = "above_requested_max_soc"
+            else:
+                reason = "above_acknowledged_max_soc"
+        fresh = data.control_data_fresh()
+        observed = (self.coordinator.data or {}) if fresh else {}
+        return {
+            "reason": reason,
+            "automatic_fallback": mode == "discharge_limit" and not data.hold_use_discharge_limit,
+            "hold_owner": data.discharge_hold_owner,
+            "hold_target_soc": data.discharge_hold_min_soc,
+            "requested_min_soc": data.min_soc,
+            "requested_max_soc": data.max_soc,
+            "acknowledged_max_soc": data.applied_max_soc,
+            "control_ready": fresh and not data.control_settling(),
+            "standby_discharge_possible": mode == "discharge_limit",
+            "observed_min_soc": observed.get(REG_BATTERY_MIN_SOC),
+            "observed_discharge_limit_w": observed.get(REG_BATTERY_MAX_DISCHARGE_POWER_W),
+        }
+
 
 class KostalBatterySoCSensor(KostalBaseSensor):
     _key = SENSOR_BATTERY_SOC
@@ -1161,3 +1219,4 @@ class KostalKsemHomeConsumptionFromGridSensor(KostalKsemIntegerSensor):
     _attr_device_class = SensorDeviceClass.POWER
     _attr_native_unit_of_measurement = UnitOfPower.WATT
     _attr_state_class = SensorStateClass.MEASUREMENT
+
