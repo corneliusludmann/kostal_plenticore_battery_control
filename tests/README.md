@@ -19,7 +19,8 @@ property, not a claim that the complete pre-existing integration is covered.
 
 In a separate CPython 3.14 virtual environment, install
 `homeassistant==2026.11.1 pymodbus`, then run `python tools/ha_smoke.py` from the
-repository root. Independently verified with CPython 3.14.10. The script sits
+repository root. Also verified with `homeassistant==2026.10.4`, both on
+CPython 3.14.10. The script sits
 outside this directory so `conftest.py` cannot substitute the framework.
 
 It checks the actual HA form serializer and actual EntityComponent/RestoreNumber
@@ -54,3 +55,5 @@ Run `python tools/ha_poll_shutdown_smoke.py` in the separate real-HA environment
 to check an in-flight `async_refresh` through successful entry unload and repeated
 shutdown. It uses the real coordinator and Modbus locking with an in-memory
 transport; platform unload is mocked successful. No live services are accessed.
+
+Both smoke scripts pass with HA 2026.10.4 and 2026.11.1 on CPython 3.14.10.

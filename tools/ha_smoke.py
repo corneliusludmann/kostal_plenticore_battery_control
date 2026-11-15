@@ -1,6 +1,6 @@
 """Real HA smoke tests, isolated from tests/conftest.py.
 
-Validated with Home Assistant 2026.11.1 and CPython 3.14.10.
+Validated with Home Assistant 2026.10.4 / 2026.11.1 and CPython 3.14.10.
 Run in a disposable venv: pip install homeassistant==2026.11.1 pymodbus
 Then: python tools/ha_smoke.py
 
@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import probatio
 from homeassistant import const
-from homeassistant.components.number.entity import NumberExtraStoredData
+from homeassistant.components.number import NumberExtraStoredData
 from homeassistant.config_entries import ConfigEntries
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import (
@@ -74,11 +74,18 @@ async def smoke(config_dir: str) -> None:
     data._soc_limit_entities = entities
     data._soc_restore_pending = {entity._key for entity in entities}
     data.soc_limits_ready = False
+    restore_data = restore_state.async_get(hass)
+    # HA 2026.11 split the restore cache by entity and registry ID.
+    restored_states = (
+        restore_data.last_states_by_entity_id
+        if hasattr(restore_data, "last_states_by_entity_id")
+        else restore_data.last_states
+    )
     for entity, value in zip(entities, (20, 80), strict=True):
         entity.entity_id = f"number.{entity._key}"
         # Standalone platform: exercise restore/lifecycle without device binding.
         entity._attr_unique_id = None
-        restore_state.async_get(hass).last_states_by_entity_id[entity.entity_id] = (
+        restored_states[entity.entity_id] = (
             restore_state.StoredState(
                 State(entity.entity_id, str(value)),
                 NumberExtraStoredData(100, 0, 1, "%", value),
