@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import re
@@ -19,6 +20,8 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
+
+from .modbus_handler import CONTROL_WRITE_GUARD, validate_modbus_timeout
 
 from .const import (
     CONF_UNIT_ID,
@@ -186,6 +189,8 @@ class KostalCoordinator(DataUpdateCoordinator[dict[Any, Any]]):
         fetch is retried after REST_VERSION_RETRY_SECONDS, and the last known
         version is kept in the meantime.
         """
+        if not self._kostal_data.allow_http_firmware_fallback:
+            return None
         now = time.monotonic()
         if now < self._rest_version_next_try:
             return self._rest_version
@@ -219,6 +224,7 @@ class KostalCoordinator(DataUpdateCoordinator[dict[Any, Any]]):
         return self._rest_version
 
     async def _async_update_data(self) -> dict:
+        poll_started = time.monotonic()
         try:
             # First poll after an outage: re-probe everything. A register refused
             # while the inverter was rebooting is not necessarily missing, and a
@@ -346,6 +352,13 @@ class KostalCoordinator(DataUpdateCoordinator[dict[Any, Any]]):
                     except Exception as err:
                         _LOGGER.debug("Failed to read %s: %s", label, err)
                         data[reg] = None
+            self._kostal_data.last_control_update = poll_started
+            self._kostal_data.control_values_valid = (
+                all(isinstance(data.get(reg), (int, float)) and math.isfinite(data[reg])
+                    for reg in (REG_BATTERY_SOC, REG_BATTERY_POWER))
+                and 0 <= data[REG_BATTERY_SOC] <= 100
+                and data.get(REG_BATTERY_MGMT_MODE) == 2
+            )
             recovered = self._kostal_data.mark_communication_restored()
             if recovered:
                 _LOGGER.info("Communication with Kostal inverter restored")
@@ -353,6 +366,7 @@ class KostalCoordinator(DataUpdateCoordinator[dict[Any, Any]]):
             return data
         except Exception as err:
             self._kostal_data.mark_communication_lost(str(err))
+            self._kostal_data.notify_connection_lost()
             raise UpdateFailed(f"Error communicating with Kostal inverter: {err}") from err
 
 
@@ -401,7 +415,17 @@ class KostalData:
     # A hold has written 1040 = 0 and it has not been restored yet
     discharge_limit_blocked: bool = False
     max_soc: float = DEFAULT_MAX_SOC_LIMIT
-    auto_resume_on_recovery: bool = True
+    control_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    transition_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    last_control_update: float | None = None
+    control_values_valid: bool = False
+    soc_limits_valid: bool = True
+    soc_limits_ready: bool = False
+    allow_http_firmware_fallback: bool = False
+    control_max_data_age: float = 60.0
+    charge_max_duration_minutes: int = 60
+    shutting_down: bool = False
+    auto_resume_on_recovery: bool = False
     communication_ok: bool = True
     last_error: str | None = None
     control_fault_latched: bool = False
@@ -422,6 +446,13 @@ class KostalData:
     inverter_control_status: str = "Inactive"
     inverter_control_target_w: float | None = None
     inverter_control_house_load_w: float | None = None
+
+    def control_data_fresh(self) -> bool:
+        return (
+            not self.shutting_down and self.communication_ok and self.control_values_valid and self.soc_limits_valid and self.soc_limits_ready
+            and self.last_control_update is not None
+            and 0 <= time.monotonic() - self.last_control_update <= self.control_max_data_age
+        )
 
     def register_runtime_switch(self, switch: Any) -> None:
         self.runtime_switches[switch._key] = switch
@@ -614,7 +645,7 @@ class KostalData:
 
     def hold_min_soc(self, soc_percent: float) -> float:
         """Min SOC a discharge hold at soc_percent writes: soc_percent + the hold offset, at most 100 %."""
-        return min(100.0, soc_percent + self.hold_soc_offset)
+        return min(self.max_soc, soc_percent + self.hold_soc_offset)
 
     def effective_min_soc(self) -> float:
         """Min SOC for 1042: the user's limit or a discharge hold, whichever is higher.
@@ -623,7 +654,7 @@ class KostalData:
         """
         if self.discharge_hold_min_soc is None or self.hold_use_discharge_limit:
             return self.min_soc
-        return max(self.min_soc, self.discharge_hold_min_soc)
+        return min(self.max_soc, max(self.min_soc, self.discharge_hold_min_soc))
 
     async def async_restore_discharge_limit(self) -> None:
         """Write the battery's maximum back to 1040 if a hold blocked it, or if it reads as blocked."""
@@ -704,6 +735,10 @@ class KostalData:
         self.resume_pending_switches.discard(switch_key)
         self.control_fault_latched = bool(self.resume_pending_switches)
 
+    def notify_connection_lost(self) -> None:
+        for switch in self.runtime_switches.values():
+            switch.handle_connection_lost()
+
     def notify_connection_restored(self) -> None:
         for switch in self.runtime_switches.values():
             handler = getattr(switch, "handle_connection_restored", None)
@@ -729,10 +764,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Kostal Modbus Control from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
+    from .config_flow import validate_control_options
+    validate_control_options(dict(entry.options))
     host = entry.data[CONF_HOST]
     port = DEFAULT_PORT  # Always 1502 for Plenticore
     unit_id = DEFAULT_UNIT_ID  # Always 71 for Plenticore battery management
-    timeout = entry.data.get(CONF_MODBUS_TIMEOUT, DEFAULT_MODBUS_TIMEOUT)
+    timeout = validate_modbus_timeout(entry.data.get(CONF_MODBUS_TIMEOUT, DEFAULT_MODBUS_TIMEOUT))
 
     _LOGGER.info("Setting up Kostal Modbus: host=%s port=%s unit_id=%s", host, port, unit_id)
 
@@ -821,6 +858,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "kostal_modbus_initial_refresh",
     )
     data.coordinator = coordinator
+    _apply_safety_options(entry.options, data)
     _apply_grid_control_options(entry.options, data)
     _apply_hold_options(entry.options, data)
 
@@ -840,11 +878,14 @@ async def _async_options_update_listener(hass: HomeAssistant, entry: ConfigEntry
     is selected, so adding or removing it needs a reload. Tuning changes are
     applied to the running loop directly.
     """
+    from .config_flow import validate_control_options
+    validate_control_options(dict(entry.options))
     data: KostalData = hass.data[DOMAIN][entry.entry_id]
     new_entity = entry.options.get(CONF_SOURCE_GRID_POWER_ENTITY) or None
     if bool(new_entity) != bool(data.source_grid_power_entity):
         await hass.config_entries.async_reload(entry.entry_id)
         return
+    _apply_safety_options(entry.options, data)
     _apply_grid_control_options(entry.options, data)
     previous_use_limit = data.hold_use_discharge_limit
     _apply_hold_options(entry.options, data)
@@ -853,6 +894,16 @@ async def _async_options_update_listener(hass: HomeAssistant, entry: ConfigEntry
 
 
 async def _async_switch_hold_register(data: KostalData, used_limit: bool) -> None:
+    async with data.control_lock:
+        token = CONTROL_WRITE_GUARD.set(lambda: data.control_data_fresh() and not data.control_settling())
+        try:
+            if data.control_data_fresh():
+                await _async_switch_hold_register_locked(data, used_limit)
+        finally:
+            CONTROL_WRITE_GUARD.reset(token)
+
+
+async def _async_switch_hold_register_locked(data: KostalData, used_limit: bool) -> None:
     """Move a running hold to the register the option now selects: the new one first, so the hold has no gap."""
     if data.control_settling():
         # A write now would keep a stopped setpoint alive; the old register times out by itself
@@ -901,15 +952,36 @@ def _apply_grid_control_options(options: Any, data: KostalData) -> None:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    data: KostalData = hass.data[DOMAIN][entry.entry_id]
+    data.shutting_down = True
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        data: KostalData = hass.data[DOMAIN].pop(entry.entry_id)
+        hass.data[DOMAIN].pop(entry.entry_id)
         await data.handler.close()
         if data.ksem_handler is not None:
             await data.ksem_handler.close()
 
+    else:
+        data.shutting_down = False
     return unload_ok
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Remove the learned battery values of a deleted config entry."""
     await Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}").async_remove()
+
+
+def _apply_safety_options(options: Any, data: KostalData) -> None:
+    """Validate stored options as well as UI input before enabling writes."""
+    resume = options.get("auto_resume_on_recovery", False)
+    age = options.get("control_max_data_age", 60)
+    duration = options.get("charge_max_duration_minutes", 60)
+    if not isinstance(resume, bool):
+        raise ValueError("auto_resume_on_recovery must be a boolean")
+    if isinstance(age, bool) or not isinstance(age, (int, float)) or not math.isfinite(age) or not 10 <= age <= 300:
+        raise ValueError("control_max_data_age must be between 10 and 300 seconds")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration != int(duration) or not 1 <= duration <= 1440:
+        raise ValueError("charge_max_duration_minutes must be an integer between 1 and 1440")
+    data.allow_http_firmware_fallback = options.get("allow_http_firmware_fallback", False)
+    data.auto_resume_on_recovery = resume
+    data.control_max_data_age = float(age)
+    data.charge_max_duration_minutes = int(duration)

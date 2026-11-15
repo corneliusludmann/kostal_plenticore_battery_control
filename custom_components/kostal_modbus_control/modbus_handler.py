@@ -3,11 +3,32 @@ import math
 import struct
 import asyncio
 import inspect
+from contextvars import ContextVar
+from collections.abc import Callable
 from pymodbus.client import AsyncModbusTcpClient
+
+
+CONTROL_WRITE_GUARD: ContextVar[Callable[[], bool] | None] = ContextVar("kostal_control_write_guard", default=None)
+
+
+def validate_modbus_timeout(value):
+    """Validate the supported configured inverter timeout, without coercion.
+
+    This value must match the inverter setting. A range check alone cannot
+    verify that setting. The 10..3600 range is a software policy, not a
+    claim about a separate manufacturer register or its allowed range.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or not 10 <= value <= 3600:
+        raise ValueError("Modbus timeout must be an integer between 10 and 3600 seconds")
+    return value
 
 
 class KostalModbusError(Exception):
     """Base exception for Modbus operation failures."""
+
+
+class KostalModbusWriteAborted(KostalModbusError):
+    """A queued control write lost its authorization before transport send."""
 
 
 class KostalModbusConnectionError(KostalModbusError):
@@ -67,7 +88,13 @@ class KostalModbusHandler:
 
     def _float_to_register_words(self, value):
         """Encode a float into two Modbus registers using configured word order."""
-        raw = struct.pack(">f", float(value))
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError("Modbus float writes must be finite")
+        try:
+            raw = struct.pack(">f", value)
+        except OverflowError as err:
+            raise ValueError("Modbus float write exceeds float32 range") from err
         high_word, low_word = struct.unpack(">HH", raw)
         if self._word_swapped_32bit:
             return [low_word, high_word]
@@ -96,6 +123,7 @@ class KostalModbusHandler:
         if self._client:
             self._client.close()
             self._client = None
+        self._unit_kwarg = None
 
     async def _run_locked_request(self, description, operation):
         """Run a Modbus request under the shared lock with timeout and teardown."""
@@ -103,6 +131,12 @@ class KostalModbusHandler:
             try:
                 await asyncio.wait_for(self._ensure_connected(), timeout=self._operation_timeout)
                 result = await asyncio.wait_for(operation(), timeout=self._operation_timeout)
+            except asyncio.CancelledError:
+                # A cancelled response must not be reused by the next request.
+                self._close_unlocked()
+                raise
+            except KostalModbusWriteAborted:
+                raise
             except asyncio.TimeoutError as err:
                 self._logger.warning("Timeout during %s", description)
                 self._close_unlocked()
@@ -149,8 +183,9 @@ class KostalModbusHandler:
                 self._unit_kwarg = name
                 self._logger.debug("Using '%s' as unit_id kwarg", name)
                 return
-        self._unit_kwarg = ""  # No unit kwarg found
-        self._logger.warning("No unit/slave/dev_id param found — unit_id will NOT be sent!")
+        raise KostalModbusConnectionError(
+            "Unsupported pymodbus API: cannot explicitly address the configured unit ID"
+        )
 
     async def _safe_read(self, address, count):
         """Read holding registers with auto-detected unit_id parameter name."""
@@ -166,6 +201,7 @@ class KostalModbusHandler:
         kwargs = {"values": values}
         if self._unit_kwarg:
             kwargs[self._unit_kwarg] = self._unit_id
+        self._check_write_guard()
         return await self._require_client().write_registers(address, **kwargs)
 
     async def _safe_write_single(self, address, value):
@@ -174,7 +210,14 @@ class KostalModbusHandler:
         kwargs = {"value": value}
         if self._unit_kwarg:
             kwargs[self._unit_kwarg] = self._unit_id
+        self._check_write_guard()
         return await self._require_client().write_register(address, **kwargs)
+
+    @staticmethod
+    def _check_write_guard():
+        guard = CONTROL_WRITE_GUARD.get()
+        if guard is not None and not guard():
+            raise KostalModbusWriteAborted("Control write no longer authorized")
 
     async def read_string(self, address, length):
         """Reads a string from holding registers."""

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
+import math
 import asyncio
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
@@ -71,7 +72,7 @@ from .const import (
     SIGNAL_INVERTER_CONTROL_UPDATED,
     SIGNAL_PREDBAT_STATUS_UPDATED,
 )
-from .modbus_handler import KostalModbusHandler
+from .modbus_handler import KostalModbusHandler, CONTROL_WRITE_GUARD, KostalModbusWriteAborted
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -158,6 +159,9 @@ class KostalBaseSwitch(SwitchEntity):
         self._related_switches = []
         self._faulted = False
         self._resume_pending = False
+        self._removed = False
+        self._charge_deadline = None
+        self._deadline_timer = None
         
         # Calculate derived timings
         # Loop interval = Inverter Timeout / 2 (send twice per timeout period)
@@ -174,8 +178,14 @@ class KostalBaseSwitch(SwitchEntity):
     async def async_will_remove_from_hass(self) -> None:
         # Stop the write loop on unload/reload — otherwise the removed entity
         # keeps writing through the handler, which reconnects by itself
+        self._removed = True
+        self._attr_is_on = False
         self._cancel_start_task()
         self._cancel_loop_timer()
+        self._cancel_deadline()
+        await self._drain_start_task()
+        async with self._data.control_lock:
+            self._data.last_stop_time = time.time()
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -190,15 +200,37 @@ class KostalBaseSwitch(SwitchEntity):
             "resume_pending": self._resume_pending,
             "loop_running": self._remove_timer is not None,
             "auto_resume_enabled": self._should_auto_resume_on_recovery(),
+            "charge_seconds_remaining": None if self._charge_deadline is None else max(0, round(self._charge_deadline - time.monotonic())),
         }
 
     def _should_auto_resume_on_recovery(self) -> bool:
-        return self._auto_resume_on_recovery
+        return self._auto_resume_on_recovery and self._data.auto_resume_on_recovery and not self._deadline_expired()
+
+    def _deadline_expired(self) -> bool:
+        return self._charge_deadline is not None and time.monotonic() >= self._charge_deadline
+
+    def _cancel_deadline(self) -> None:
+        if self._deadline_timer is not None:
+            self._deadline_timer()
+            self._deadline_timer = None
+
+    async def _expire_charge(self, _now=None) -> None:
+        await self.async_turn_off()
+
+    def _write_allowed(self) -> bool:
+        return (self._attr_is_on and not self._removed and not self._deadline_expired()
+                and self._data.control_data_fresh())
 
     def _cancel_loop_timer(self) -> None:
         if self._remove_timer:
             self._remove_timer()
             self._remove_timer = None
+
+    async def _drain_start_task(self) -> None:
+        task = self._start_task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def _cancel_start_task(self) -> None:
         if self._start_task is not None and not self._start_task.done():
@@ -236,11 +268,31 @@ class KostalBaseSwitch(SwitchEntity):
             return
         self._start_task = self.hass.async_create_task(self._run_start_loop(reason))
 
+    def handle_connection_lost(self) -> None:
+        """Revoke permission immediately, even between two control ticks."""
+        if not self._attr_is_on:
+            return
+        self._cancel_loop_timer()
+        self._cancel_start_task()
+        self._faulted = True
+        self._on_communication_fault()
+        if self._should_auto_resume_on_recovery():
+            self._set_resume_pending(True)
+        elif not self._keep_enabled_on_fault:
+            self._attr_is_on = False
+            self._set_resume_pending(False)
+            self._cancel_deadline()
+        if not self._keep_enabled_on_fault:
+            self._data.last_stop_time = time.time()
+        self.async_write_ha_state()
+
     def handle_connection_restored(self) -> None:
         if self._keep_enabled_on_fault:
             if self._attr_is_on and self._faulted:
                 _LOGGER.info("%s cleared communication fault after recovery", self.name)
                 self._faulted = False
+                if self._remove_timer is None:
+                    self._schedule_start_loop("monitor recovery")
                 self.async_write_ha_state()
             return
 
@@ -260,7 +312,13 @@ class KostalBaseSwitch(SwitchEntity):
 
     async def _run_start_loop(self, reason: str) -> None:
         try:
-            await self._start_loop()
+            # A stop by another control can extend settling while startup waits.
+            # Retry instead of leaving an enabled switch with no running timer.
+            while self._attr_is_on and not self._removed:
+                await self._start_loop()
+                if self._remove_timer is not None or self._faulted or not self._attr_is_on:
+                    break
+                await asyncio.sleep(max(0.1, self._data.control_settle_remaining()))
         except asyncio.CancelledError:
             raise
         except Exception as err:
@@ -270,7 +328,18 @@ class KostalBaseSwitch(SwitchEntity):
 
     async def _run_guarded_action(self, action, phase: str, *args) -> bool:
         try:
-            await asyncio.wait_for(action(*args), timeout=self._action_timeout)
+            async with self._data.control_lock:
+                if not self._attr_is_on or self._removed:
+                    return False
+                if self._data.control_settling():
+                    return False
+                if not self._write_allowed():
+                    raise KostalModbusWriteAborted("Control data is stale, settling, or the charge session expired")
+                token = CONTROL_WRITE_GUARD.set(self._write_allowed)
+                try:
+                    await asyncio.wait_for(action(*args), timeout=self._action_timeout)
+                finally:
+                    CONTROL_WRITE_GUARD.reset(token)
             return True
         except asyncio.CancelledError:
             raise
@@ -285,7 +354,7 @@ class KostalBaseSwitch(SwitchEntity):
         self._cancel_loop_timer()
         self._data.mark_communication_lost(f"{self.name}: {err}")
         self._faulted = True
-        await self._data.handler.close()
+        self._data.last_stop_time = time.time()
         self._on_communication_fault()
 
         if self._should_auto_resume_on_recovery():
@@ -318,6 +387,9 @@ class KostalBaseSwitch(SwitchEntity):
             )
             self._write_activity(f"turned off after {phase} failure")
 
+        if not self._attr_is_on:
+            self._cancel_deadline()
+        await self._data.handler.close()
         self.async_write_ha_state()
 
     def _on_communication_fault(self) -> None:
@@ -339,7 +411,15 @@ class KostalBaseSwitch(SwitchEntity):
             await self._data.handler.close()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the switch on."""
+        async with self._data.transition_lock:
+            await self._turn_on_locked(**kwargs)
+
+    async def _turn_on_locked(self, **kwargs: Any) -> None:
+        """Turn the switch on with exclusive ownership of the transition."""
+        if self._removed:
+            return
+        if not self._data.control_data_fresh():
+            raise ValueError("Fresh battery data and Modbus battery management are required")
         if self._attr_is_on:
             _LOGGER.debug("%s turn_on ignored because switch is already on", self.name)
             self.async_write_ha_state()
@@ -349,12 +429,17 @@ class KostalBaseSwitch(SwitchEntity):
         for switch in self._related_switches:
             if switch is not self:
                 if switch.is_on:
-                    await switch.async_turn_off()
+                    await switch._turn_off_locked()
                 await switch.async_release_background_hold()
 
         self._faulted = False
         self._set_resume_pending(False)
         self._attr_is_on = True
+        if self._key == SWITCH_CHARGE_START:
+            duration = self._data.charge_max_duration_minutes * 60
+            self._charge_deadline = time.monotonic() + duration
+            self._cancel_deadline()
+            self._deadline_timer = async_call_later(self.hass, duration, self._expire_charge)
         self.async_write_ha_state()
         self._schedule_start_loop("manual start")
 
@@ -380,17 +465,28 @@ class KostalBaseSwitch(SwitchEntity):
             self._start_periodic_loop()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn the switch off."""
-        if not self._attr_is_on:
-            self.async_write_ha_state()
-            return
+        async with self._data.transition_lock:
+            await self._turn_off_locked()
 
+    async def _turn_off_locked(self) -> None:
+        """Revoke the writer before draining actions, then establish write silence."""
+        was_on = self._attr_is_on
+        self._attr_is_on = False
         self._cancel_start_task()
         self._cancel_loop_timer()
+        self._cancel_deadline()
         self._faulted = False
         self._set_resume_pending(False)
-        self._attr_is_on = False
-        await self._run_stop_action()
+        await self._drain_start_task()
+        async with self._data.control_lock:
+            if was_on:
+                try:
+                    if self._data.control_data_fresh():
+                        await self._run_stop_action()
+                finally:
+                    # Timestamp after the final write, not before waiting for a busy transport.
+                    if not self._keep_enabled_on_fault:
+                        self._data.last_stop_time = time.time()
         self.async_write_ha_state()
 
     def _max_charge_watts(self) -> float:
@@ -560,7 +656,8 @@ class KostalChargeStartSwitch(KostalBaseSwitch):
         if state is None:
             return None
         try:
-            return float(state.state)
+            value = float(state.state)
+            return value if math.isfinite(value) else None
         except (ValueError, TypeError):
             return None
 
@@ -573,13 +670,18 @@ class KostalChargeStartSwitch(KostalBaseSwitch):
         """
         if self._attr_is_on or self._reserve_hold_lock.locked():
             return
-        async with self._reserve_hold_lock:
+        async with self._data.control_lock, self._reserve_hold_lock:
+            if self._removed or not self._data.control_data_fresh():
+                return
+            token = CONTROL_WRITE_GUARD.set(lambda: not self._removed and self._data.control_data_fresh() and not self._data.control_settling())
             try:
                 await self._evaluate_reserve_hold()
             except Exception as err:
                 self._data.mark_communication_lost(f"{self.name} reserve hold: {err}")
                 _LOGGER.warning("Predbat reserve hold: write failed: %s", err)
                 await self._data.handler.close()
+            finally:
+                CONTROL_WRITE_GUARD.reset(token)
 
     async def _evaluate_reserve_hold(self) -> None:
         if self._attr_is_on:
@@ -636,13 +738,18 @@ class KostalChargeStartSwitch(KostalBaseSwitch):
         await self._release_discharge_hold()
 
     async def async_release_background_hold(self) -> None:
-        async with self._reserve_hold_lock:
+        async with self._data.control_lock, self._reserve_hold_lock:
+            if self._removed or not self._data.control_data_fresh() or self._data.control_settling():
+                return
+            token = CONTROL_WRITE_GUARD.set(lambda: not self._removed and self._data.control_data_fresh() and not self._data.control_settling())
             try:
                 await self._release_reserve_hold()
             except Exception as err:
                 self._data.mark_communication_lost(f"{self.name} reserve hold: {err}")
                 _LOGGER.warning("Predbat reserve hold: release failed: %s", err)
                 await self._data.handler.close()
+            finally:
+                CONTROL_WRITE_GUARD.reset(token)
 
     def _is_predbat_active(self) -> bool:
         """Return True when select.predbat_mode exists and is in an active control mode."""
@@ -814,7 +921,8 @@ class KostalChargeStartSwitch(KostalBaseSwitch):
         if state is None:
             return None
         try:
-            return float(state.state)
+            value = float(state.state)
+            return value if math.isfinite(value) else None
         except (ValueError, TypeError):
             return None
 
@@ -986,8 +1094,19 @@ class KostalChargeStartSwitch(KostalBaseSwitch):
     def _charge_target_watts(self) -> float:
         """Charge rate in Watts, capped by EMS Grid Protection while it is active."""
         target_watts = abs(self._data.charge_power_w())
-        if self._data.ems_status != "Inactive" and self._data.ems_charge_limit_w is not None:
-            target_watts = min(target_watts, self._data.ems_charge_limit_w)
+        monitor = self._data.runtime_switches.get(SWITCH_EMS)
+        if monitor is not None and monitor.is_on:
+            readings = self._data.coordinator.data if self._data.coordinator else None
+            if not readings or not all(
+                isinstance(readings.get(reg), (int, float)) and math.isfinite(readings[reg])
+                for reg in (REG_CURRENT_PHASE1, REG_CURRENT_PHASE2, REG_CURRENT_PHASE3)
+            ):
+                return 0.0
+            # Until the enabled monitor has evaluated its first sample, do not charge.
+            limit = self._data.ems_charge_limit_w
+            if limit is None or not math.isfinite(limit):
+                return 0.0
+            target_watts = min(target_watts, max(0.0, limit))
         return target_watts
 
     async def _predbat_loop_action(self) -> None:
@@ -1154,8 +1273,7 @@ class KostalChargeStartSwitch(KostalBaseSwitch):
             # Close the Modbus connection so the inverter sees a clean disconnect.
             # It will reconnect automatically on the next read/write.
             await self._data.handler.close()
-        # Let the reserve hold take over now rather than on its next tick
-        await self._async_reserve_hold_tick()
+        # The independent reserve timer can take over after the settling interval.
 
     def _on_communication_fault(self) -> None:
         self._set_predbat_status("Inactive")
@@ -1247,11 +1365,8 @@ class KostalEMSSwitch(KostalBaseSwitch, RestoreEntity):
     async def async_added_to_hass(self) -> None:
         """Restore on/off state after HA restart."""
         last = await self.async_get_last_state()
-        if last is not None:
-            self._attr_is_on = last.state == "on"
-
-        if self._attr_is_on:
-            self._schedule_start_loop("state restore")
+        # Control requires a new explicit start after a Home Assistant restart.
+        self._attr_is_on = False
 
         self.async_write_ha_state()
 
@@ -1306,8 +1421,12 @@ class KostalEMSSwitch(KostalBaseSwitch, RestoreEntity):
         phase2 = data.get(REG_CURRENT_PHASE2)
         phase3 = data.get(REG_CURRENT_PHASE3)
 
-        if phase1 is None or phase2 is None or phase3 is None:
-            _LOGGER.warning("EMS: Phase current read failed — skipping cycle")
+        if not all(isinstance(value, (int, float)) and math.isfinite(value)
+                   for value in (phase1, phase2, phase3)):
+            self._data.ems_charge_limit_w = 0.0
+            self._ems_smoothed_limit = 0.0
+            self._set_ems_status("Blocked")
+            _LOGGER.warning("EMS: Phase current unavailable — blocking charge until fresh readings recover")
             return
 
         fuse_size = self._data.fuse_size
@@ -1451,13 +1570,16 @@ class KostalInverterControlSwitch(KostalBaseSwitch, RestoreEntity):
     async def async_added_to_hass(self) -> None:
         """Restore inverter control state after HA restart."""
         last = await self.async_get_last_state()
-        if last is not None:
-            self._attr_is_on = last.state == "on"
-
-        if self._attr_is_on:
-            self._schedule_start_loop("state restore")
+        # Control requires a new explicit start after a Home Assistant restart.
+        self._attr_is_on = False
 
         self.async_write_ha_state()
+
+    def _write_allowed(self) -> bool:
+        reading = self._grid_reading_time()
+        return (super()._write_allowed() and reading is not None and reading.tzinfo is not None
+                and 0 <= (datetime.now(timezone.utc) - reading).total_seconds() <= self._data.control_max_data_age
+                and self._get_float_state(self._data.source_grid_power_entity) is not None)
 
     def _get_float_state(self, entity_id: str | None) -> float | None:
         if not entity_id:
@@ -1466,7 +1588,8 @@ class KostalInverterControlSwitch(KostalBaseSwitch, RestoreEntity):
         if state is None or state.state in {"unknown", "unavailable", "none", "None"}:
             return None
         try:
-            return float(state.state)
+            value = float(state.state)
+            return value if math.isfinite(value) else None
         except (TypeError, ValueError):
             return None
 
@@ -1574,6 +1697,11 @@ class KostalInverterControlSwitch(KostalBaseSwitch, RestoreEntity):
         # a load drop the battery undershoots. Repeat the last setpoint instead,
         # which also keeps the inverter's Modbus timeout from expiring.
         reading_time = self._grid_reading_time()
+        if reading_time is None or reading_time.tzinfo is None:
+            raise ValueError("Grid measurement has no valid timestamp")
+        age = (datetime.now(timezone.utc) - reading_time).total_seconds()
+        if not 0 <= age <= self._data.control_max_data_age or self._get_float_state(self._data.source_grid_power_entity) is None:
+            raise ValueError("Grid measurement is stale or non-finite")
         last_setpoint = self._data.last_inverter_control_setpoint_w
         if reading_time is not None and reading_time == self._last_grid_reading and last_setpoint is not None:
             _LOGGER.debug("Inverter Control: no new grid reading — repeating setpoint %.0fW", last_setpoint)
@@ -1588,8 +1716,7 @@ class KostalInverterControlSwitch(KostalBaseSwitch, RestoreEntity):
         inputs = self._grid_inputs(battery_power)
         if inputs is None:
             self._publish_state("Unavailable")
-            await self._write_power_setpoint(0.0)
-            return
+            raise ValueError("Required grid control measurements are unavailable")
 
         filtered_house_load = inputs["filtered_house_load"]
         proposed_watts, status = self._grid_target_watts(inputs)

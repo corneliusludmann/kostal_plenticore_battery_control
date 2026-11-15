@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 import voluptuous as vol
@@ -41,9 +42,35 @@ from .const import (
     CONF_HOLD_SOC_OFFSET, DEFAULT_HOLD_SOC_OFFSET, HOLD_SOC_OFFSET_RANGE,
     CONF_HOLD_USE_DISCHARGE_LIMIT, DEFAULT_HOLD_USE_DISCHARGE_LIMIT,
 )
-from .modbus_handler import KostalModbusHandler
+from .modbus_handler import KostalModbusHandler, validate_modbus_timeout
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def validate_control_options(options: dict[str, Any]) -> None:
+    """Validate safety options at both the UI and stored-config boundaries."""
+    bounds = {
+        "control_max_data_age": (10, 300),
+        "charge_max_duration_minutes": (1, 1440),
+        CONF_HOLD_SOC_OFFSET: HOLD_SOC_OFFSET_RANGE,
+        CONF_GRID_TARGET_W: (-20000, 20000),
+        CONF_GRID_DEADBAND_W: (0, 5000),
+        CONF_EXTERNAL_CONTROL_MAX_DISCHARGE_W: (0, 50000),
+        CONF_EXTERNAL_CONTROL_MAX_CHARGE_W: (0, 50000),
+        CONF_EXTERNAL_CONTROL_HYSTERESIS_W: (0, 5000),
+        CONF_EXTERNAL_CONTROL_EMA_ALPHA: (MIN_EXTERNAL_CONTROL_EMA_ALPHA, 1),
+    }
+    for key, (minimum, maximum) in bounds.items():
+        value = options.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not minimum <= value <= maximum:
+            raise ValueError(f"Invalid value for {key}")
+        if key in ("control_max_data_age", "charge_max_duration_minutes") and value != int(value):
+            raise ValueError(f"{key} must be a whole number")
+    for key in ("auto_resume_on_recovery", "allow_http_firmware_fallback", CONF_HOLD_USE_DISCHARGE_LIMIT):
+        if key in options and not isinstance(options[key], bool):
+            raise ValueError(f"{key} must be a boolean")
 
 
 def _has_smart_meter(sensor_type: int | None) -> bool:
@@ -93,6 +120,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         
         if user_input is not None:
+            validate_modbus_timeout(user_input[CONF_MODBUS_TIMEOUT])
             handler = KostalModbusHandler(
                 user_input[CONF_HOST],
                 DEFAULT_PORT,
@@ -129,7 +157,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         data_schema = vol.Schema(
             {
                 vol.Required(CONF_HOST): str,
-                vol.Required(CONF_MODBUS_TIMEOUT, default=DEFAULT_MODBUS_TIMEOUT): int,
+                vol.Required(CONF_MODBUS_TIMEOUT, default=DEFAULT_MODBUS_TIMEOUT): validate_modbus_timeout,
                 vol.Required(CONF_INVERTER_TYPE, default=INVERTER_TYPE_HYBRID): SelectSelector(
                     SelectSelectorConfig(
                         options=[
@@ -249,6 +277,12 @@ class KostalOptionsFlowHandler(config_entries.OptionsFlow):
     ) -> ConfigFlowResult:
         max_power = self._max_battery_power_w()
         if user_input is not None:
+            try:
+                validate_control_options(user_input)
+            except (TypeError, ValueError):
+                result = await self.async_step_init()
+                result["errors"] = {"base": "invalid_options"}
+                return result
             if not user_input.get(CONF_SOURCE_GRID_POWER_ENTITY):
                 user_input.pop(CONF_SOURCE_GRID_POWER_ENTITY, None)
             for key in (CONF_EXTERNAL_CONTROL_MAX_DISCHARGE_W, CONF_EXTERNAL_CONTROL_MAX_CHARGE_W):
@@ -262,6 +296,12 @@ class KostalOptionsFlowHandler(config_entries.OptionsFlow):
         current = self.config_entry.options
         schema = vol.Schema(
             {
+                vol.Optional("auto_resume_on_recovery", default=current.get("auto_resume_on_recovery", False)): BooleanSelector(),
+                vol.Optional("allow_http_firmware_fallback", default=current.get("allow_http_firmware_fallback", False)): BooleanSelector(),
+                vol.Optional("control_max_data_age", default=current.get("control_max_data_age", 60)):
+                    _number_selector(10, 300, 1, "s"),
+                vol.Optional("charge_max_duration_minutes", default=current.get("charge_max_duration_minutes", 60)):
+                    _number_selector(1, 1440, 1, "min"),
                 vol.Optional(
                     CONF_HOLD_SOC_OFFSET,
                     default=current.get(CONF_HOLD_SOC_OFFSET, DEFAULT_HOLD_SOC_OFFSET),

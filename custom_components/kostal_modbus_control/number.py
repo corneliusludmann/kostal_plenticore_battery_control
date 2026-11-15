@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import asyncio
+import math
 from datetime import timedelta
 from typing import Any
 
@@ -9,6 +11,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfPower
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
@@ -30,7 +33,16 @@ from .const import (
     REG_BATTERY_MAX_SOC,
 )
 
+from .modbus_handler import CONTROL_WRITE_GUARD, KostalModbusWriteAborted
+
 _LOGGER = logging.getLogger(__name__)
+
+
+def _finite_in_range(value: float, minimum: float, maximum: float) -> float:
+    value = float(value)
+    if not math.isfinite(value) or not minimum <= value <= maximum:
+        raise ValueError(f"Value must be finite and between {minimum} and {maximum}")
+    return value
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -48,6 +60,18 @@ async def async_setup_entry(
         KostalMaxSocLimitNumber(data, entry.entry_id),
     ]
 
+    # Restoring one limit must not start a writer before the other limit has
+    # been validated. Disabled entities retain their inactive defaults and are
+    # deliberately excluded: Home Assistant never calls their added hook.
+    registry = er.async_get(hass)
+    data._soc_limit_entities = entities[-2:]
+    data._soc_restore_pending = set()
+    for entity in data._soc_limit_entities:
+        entity_id = registry.async_get_entity_id("number", DOMAIN, entity._attr_unique_id)
+        registered = registry.async_get(entity_id) if entity_id is not None else None
+        if registered is None or registered.disabled_by is None:
+            data._soc_restore_pending.add(entity._key)
+    data.soc_limits_ready = not data._soc_restore_pending
     async_add_entities(entities)
 
 
@@ -123,7 +147,11 @@ class KostalPowerRateNumber(RestoreNumber):
         elif last_state is not None and last_state.attributes.get("follows_max") is True:
             self._set_fixed(None)
         else:
-            self._set_fixed(float(last_number.native_value))
+            try:
+                self._set_fixed(_finite_in_range(last_number.native_value, 0, self.native_max_value))
+            except (TypeError, ValueError):
+                _LOGGER.warning("Ignoring invalid restored power rate; using zero W")
+                self._set_fixed(0.0)
 
         coordinator = self._data.coordinator
         if coordinator is not None:
@@ -142,6 +170,7 @@ class KostalPowerRateNumber(RestoreNumber):
         self.async_write_ha_state()
 
     async def async_set_native_value(self, value: float) -> None:
+        value = _finite_in_range(value, 0, self.native_max_value)
         max_power = self._data.max_battery_power_step_w()
         if value >= (POWER_RATE_FALLBACK_MAX_W if max_power is None else max_power):
             self._set_fixed(None)
@@ -178,10 +207,16 @@ class KostalFuseSizeNumber(RestoreNumber):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         if (state := await self.async_get_last_number_data()) is not None and state.native_value is not None:
-            self._attr_native_value = state.native_value
-            self._data.fuse_size = float(state.native_value)
+            try:
+                value = _finite_in_range(state.native_value, self._attr_native_min_value, self._attr_native_max_value)
+            except (TypeError, ValueError):
+                _LOGGER.warning("Ignoring invalid restored house fuse size")
+            else:
+                self._attr_native_value = value
+                self._data.fuse_size = value
 
     async def async_set_native_value(self, value: float) -> None:
+        value = _finite_in_range(value, self._attr_native_min_value, self._attr_native_max_value)
         self._attr_native_value = value
         self._data.fuse_size = value
         self.async_write_ha_state()
@@ -226,8 +261,10 @@ class KostalSocLimitNumber(RestoreNumber):
         self._entry_id = entry_id
         self._attr_unique_id = f"{entry_id}_{self._key}"
         self._attr_native_value = self._inactive_value
+        self._removed = False
         self._remove_timer = None
         self._write_task = None
+        self._active_write_tasks: set[asyncio.Task] = set()
         self._remove_deferred_write = None
         # Write twice per inverter timeout, same as the charge/discharge loops
         self._loop_interval = max(int(self._data.inverter_timeout / 2), 5)
@@ -247,28 +284,48 @@ class KostalSocLimitNumber(RestoreNumber):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         if (state := await self.async_get_last_number_data()) is not None and state.native_value is not None:
-            self._attr_native_value = self._clamp(float(state.native_value))
+            try:
+                self._attr_native_value = self._validate_value(state.native_value)
+            except (TypeError, ValueError):
+                _LOGGER.warning("Ignoring invalid restored %s limit; SOC writes require an explicit valid setting", self._data_attr)
+                self._data.soc_limits_valid = False
+                self._attr_native_value = self._inactive_value
         if self._attr_native_value is None:
             self._attr_native_value = self._inactive_value
         self._store_value(self._attr_native_value)
         self._apply()
-        if self._is_active():
-            # Fire and forget — awaiting a Modbus round-trip here would hold up
-            # entity setup on a slow or unreachable inverter
+        pending = getattr(self._data, "_soc_restore_pending", None)
+        if pending is not None:
+            pending.discard(self._key)
+            self._data.soc_limits_ready = not pending
+            if self._data.soc_limits_ready:
+                for entity in self._data._soc_limit_entities:
+                    if entity._is_active():
+                        entity._schedule_write()
+        elif self._is_active():
             self._schedule_write()
         self.async_write_ha_state()
 
     async def async_will_remove_from_hass(self) -> None:
+        self._removed = True
         self._cancel_timer()
         if self._remove_deferred_write is not None:
             self._remove_deferred_write()
             self._remove_deferred_write = None
-        if self._write_task is not None and not self._write_task.done():
-            self._write_task.cancel()
+        tasks = set(self._active_write_tasks)
+        if self._write_task is not None:
+            tasks.add(self._write_task)
+        tasks.discard(asyncio.current_task())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._write_task = None
+        await super().async_will_remove_from_hass()
 
     async def async_set_native_value(self, value: float) -> None:
-        self._attr_native_value = self._clamp(value)
+        self._attr_native_value = self._validate_value(value)
+        self._data.soc_limits_valid = True
         self._store_value(self._attr_native_value)
         self._apply()
         self.async_write_ha_state()
@@ -286,8 +343,16 @@ class KostalSocLimitNumber(RestoreNumber):
         # release write when the limit was just set back to its inactive value.
         await self._async_write_limit()
 
-    def _clamp(self, value: float) -> float:
-        return max(self._attr_native_min_value, min(self._attr_native_max_value, value))
+    def _validate_value(self, value: float) -> float:
+        """Reject invalid pairs before mutating state or issuing any write."""
+        value = float(value)
+        if not math.isfinite(value) or not self._attr_native_min_value <= value <= self._attr_native_max_value:
+            raise ValueError("SOC limit must be finite and within its allowed range")
+        minimum = value if self._data_attr == "min_soc" else self._data.min_soc
+        maximum = value if self._data_attr == "max_soc" else self._data.max_soc
+        if not minimum <= maximum:
+            raise ValueError("Minimum SOC must not exceed maximum SOC")
+        return value
 
     def _store_value(self, value: float) -> None:
         setattr(self._data, self._data_attr, value)
@@ -336,6 +401,32 @@ class KostalSocLimitNumber(RestoreNumber):
         await self._async_write_limit()
 
     async def _async_write_limit(self) -> None:
+        task = asyncio.current_task()
+        self._active_write_tasks.add(task)
+        try:
+            # Serialize the final safety check with stop and all other writers.
+            async with self._data.control_lock:
+                if not self._write_allowed():
+                    return
+                token = CONTROL_WRITE_GUARD.set(
+                    lambda: self._write_allowed() and not self._data.control_settling()
+                )
+                try:
+                    await self._async_write_limit_locked()
+                finally:
+                    CONTROL_WRITE_GUARD.reset(token)
+        finally:
+            self._active_write_tasks.discard(task)
+
+    def _write_allowed(self) -> bool:
+        return (
+            not self._removed
+            and self._data.soc_limits_ready
+            and self._data.soc_limits_valid
+            and self._data.control_data_fresh()
+        )
+
+    async def _async_write_limit_locked(self) -> None:
         value = self._attr_native_value
         if value is None:
             return
@@ -352,6 +443,8 @@ class KostalSocLimitNumber(RestoreNumber):
             return
         try:
             await self._data.handler.write_float(self._register, self._register_value(float(value)))
+        except KostalModbusWriteAborted:
+            return
         except Exception as err:
             self._data.mark_communication_lost(f"{self.name}: {err}")
             _LOGGER.warning("%s failed to write register %d: %s", self.name, self._register, err)

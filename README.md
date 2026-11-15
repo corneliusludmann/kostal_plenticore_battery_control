@@ -1,5 +1,8 @@
 # Kostal Plenticore Battery Control for Home Assistant
 
+> Fork changes: control writes now require fresh, valid measurements; stop/unload drain active writers. Automatic recovery is opt-in (off by default), and every Charge Start session has a maximum duration (60 minutes by default, including startup waits and outages). Review [control reliability notes](docs/control-reliability.md) before upgrading. This fork has mocked automated regression tests, not hardware certification.
+
+
 This custom integration allows for advanced Battery control of Kostal Plenticore inverters via Modbus TCP. It is specifically designed to control battery charging and discharging behavior "externally," allowing you to force charge from the grid or force discharge based on Home Assistant automations (e.g., electricity prices).
 
 ## Features
@@ -24,7 +27,7 @@ This custom integration allows for advanced Battery control of Kostal Plenticore
 1.  Log in to your Kostal Inverter's Web UI (as **Installer/Parakou**).
 2.  Navigate to **Settings** -> **Battery Management**.
 3.  Change **Battery Management** to: **"External via protocol (Modbus TCP)"**.
-4.  Note the **Timeout** setting in the Web UI (default is often 30s or 60s). This must match the timeout configured in this integration.
+4.  Note the **Timeout** setting in the Web UI (default is often 30s or 60s). This must match the timeout configured in this integration. This integration accepts 10–3600 seconds as a software constraint; it does not configure the inverter timeout.
 
 Step 3 is not optional. The inverter reports its battery management mode in register `1080`:
 
@@ -88,15 +91,13 @@ After setup, **Configure** on the integration holds the discharge hold options a
 
 Each control switch exposes `faulted`, `resume_pending`, `loop_running` and `auto_resume_enabled` as attributes, which is the quickest way to see what a switch is doing.
 
-### Automatic Resume After Communication Loss
+### Communication Loss and Bounded Charging
 
-While a control switch is on, the integration keeps writing to the inverter at half the configured Modbus timeout to hold the session open. If a write fails, `Charge Start`, `Discharge Start`, `Block Charge`, `Block Discharge` and `Inverter Control` do **not** turn themselves off. Instead they:
+Control writes require a successful, sufficiently recent battery poll and Modbus battery-management mode. Missing or stale grid values stop the optional grid-control writer instead of repeating an old setpoint indefinitely. When EMS Grid Protection is enabled, missing phase currents block charging until usable readings return.
 
-1.  Stop the write loop and mark themselves `faulted`, with `resume_pending` set.
-2.  Close the Modbus connection so the next attempt reconnects cleanly.
-3.  Wait for the coordinator to reach the inverter again, then automatically restart the loop and clear the fault.
+**Automatic recovery is disabled by default.** A failed control requires a new explicit start. If enabled in Options, recovery resumes only a still-valid session and honours the settling delay (`Modbus timeout + 15s`). A Charge Start session always expires after the configured maximum duration, including startup waits and time spent disconnected; recovery never extends this deadline. A completed Stop drains active writers before returning. The inverter may still take its timeout to return to internal control.
 
-The restart honours the same settling delay as a manual start (`Modbus timeout + 15s` since the last stop), so the inverter is never written to while it is still falling back to internal control.
+Options provide a maximum measurement age (default 60 seconds) and a Charge Start duration (default 60 minutes). Changing the duration applies to the next session, not an already running deadline. Charge Start and Inverter Control are not restored as active on HA restart. The SoC number entities still restore valid limits, after validating the enabled pair together. A target SoC is an inverter limit, not an automatic end to the Charge Start session; use an HA automation to end the session at the desired target when needed.
 
 ### Predbat Control
 
@@ -157,8 +158,8 @@ Without a smart meter the inverter cannot see grid import and export, so its own
 - While the grid is within **Grid deadband** of the target, the battery keeps its current setpoint (`Grid Idle`).
 - The setpoint is capped by **Max discharge / Max charge power** and by the maximum battery control power, then written in Watts to the power setpoint register (`1034` on a hybrid, `1026` on a BI).
 - The written setpoint only changes when the new value differs by more than **Setpoint hysteresis**, so the inverter is not chased by small fluctuations.
-- If the grid entity or the battery data is unavailable, `0` is written and the status is `Unavailable`.
-- When the switch is turned off, `0` is written and the inverter falls back to its internal control after its Modbus timeout.
+- If required grid or battery measurements are unavailable, stale or non-finite, control writes are revoked and existing commands expire through the inverter timeout. Check the control fault attributes for the reason.
+- When the switch is turned off with usable measurements, `0` is written after active cycles drain. With unavailable measurements, commands simply expire. The inverter returns to internal control after its timeout.
 
 **Options:**
 | Option | Default | Description |
