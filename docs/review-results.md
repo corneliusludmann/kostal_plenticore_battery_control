@@ -32,3 +32,22 @@ Local verification:
 The regression harness imports real production modules and uses explicit
 HA/socket boundary doubles. Physical inverter behavior has not been tested.
 No deployment or plant changes were made.
+
+## Hold diagnostics and restart regression follow-up
+
+Added an enabled diagnostic sensor for selected hold method and fallback reason,
+including requested/acknowledged limits and fresh register observations. This
+does not claim physical blocking or eliminate the inverter's standby draw.
+
+Two independent reviewers inspected the diagnostic implementation and restart
+regressions. No blocking issues remained. The startup baseline of 100% before
+the first acknowledged maximum write and the boundaries of transient-zero
+protection are documented. The partial-poll regression also executes a control
+tick after permission has been revoked.
+
+- 142 unit/regression tests pass (11 additional cases).
+- The real HA smoke also validates diagnostic entity registration, coordinator
+  updates, outage attributes and listener cleanup on HA 2026.11.1.
+- Restart cases use hypothetical Modbus samples based on a separate HA REST
+  observation; existing quiet intervals cover the tested short transients.
+  No general zero filter or state whitelist was added.

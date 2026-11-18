@@ -95,6 +95,9 @@ class Store:
 
 module('homeassistant')
 module('homeassistant.components')
+module('homeassistant.components.sensor', SensorEntity=type('SensorEntity', (Entity,), {}),
+       SensorDeviceClass=SimpleNamespace(**{k:k.lower() for k in ['BATTERY','CURRENT','ENERGY','ENERGY_STORAGE','ENUM','POWER','TEMPERATURE','VOLTAGE']}),
+       SensorStateClass=SimpleNamespace(MEASUREMENT='measurement', TOTAL_INCREASING='total_increasing'))
 module('homeassistant.components.switch', SwitchEntity=type('SwitchEntity', (Entity,), {}))
 module('homeassistant.components.number', RestoreNumber=RestoreNumber,
        NumberDeviceClass=SimpleNamespace(POWER='power'), NumberMode=SimpleNamespace(BOX='box'))
@@ -104,7 +107,9 @@ module('homeassistant.core', HomeAssistant=SimpleNamespace, callback=lambda f: f
 module('homeassistant.const', CONF_HOST='host', PERCENTAGE='%',
        Platform=SimpleNamespace(SENSOR='sensor', SWITCH='switch', NUMBER='number'),
        EntityCategory=SimpleNamespace(CONFIG='config', DIAGNOSTIC='diagnostic'),
-       UnitOfPower=SimpleNamespace(WATT='W'))
+       UnitOfPower=SimpleNamespace(WATT='W'),
+       UnitOfElectricPotential=SimpleNamespace(VOLT='V'), UnitOfElectricCurrent=SimpleNamespace(AMPERE='A'),
+       UnitOfTemperature=SimpleNamespace(CELSIUS='°C'), UnitOfEnergy=SimpleNamespace(WATT_HOUR='Wh', KILO_WATT_HOUR='kWh'))
 module('homeassistant.exceptions', ConfigEntryNotReady=type('ConfigEntryNotReady', (Exception,), {}),
        HomeAssistantError=type('HomeAssistantError', (Exception,), {}))
 module('homeassistant.helpers')
@@ -112,7 +117,7 @@ module('homeassistant.helpers.entity_platform', AddEntitiesCallback=object)
 module('homeassistant.helpers.event', async_call_later=lambda *a, **kw: Mock(),
        async_track_state_change_event=lambda *a, **kw: Mock(),
        async_track_time_interval=lambda *a, **kw: Mock())
-module('homeassistant.helpers.dispatcher', async_dispatcher_send=lambda *a: None)
+module('homeassistant.helpers.dispatcher', async_dispatcher_send=lambda *a: None, async_dispatcher_connect=lambda *a: Mock())
 module('homeassistant.helpers.device_registry', DeviceInfo=dict,
        async_get=lambda hass: Mock())
 module('homeassistant.helpers.entity_registry', async_get=lambda hass: SimpleNamespace(
@@ -120,7 +125,14 @@ module('homeassistant.helpers.entity_registry', async_get=lambda hass: SimpleNam
 module('homeassistant.helpers.restore_state', RestoreEntity=RestoreEntity)
 module('homeassistant.helpers.storage', Store=Store)
 module('homeassistant.helpers.aiohttp_client', async_get_clientsession=lambda hass: Mock())
-module('homeassistant.helpers.update_coordinator', DataUpdateCoordinator=Coordinator,
+class CoordinatorEntity(Entity):
+    def __class_getitem__(cls, item):
+        return cls
+    def __init__(self, coordinator):
+        self.coordinator = coordinator
+
+
+module('homeassistant.helpers.update_coordinator', DataUpdateCoordinator=Coordinator, CoordinatorEntity=CoordinatorEntity,
        UpdateFailed=type('UpdateFailed', (Exception,), {}))
 module('homeassistant.helpers.selector', BooleanSelector=Selector, EntitySelector=Selector,
        EntitySelectorConfig=dict, NumberSelector=Selector, NumberSelectorConfig=dict,

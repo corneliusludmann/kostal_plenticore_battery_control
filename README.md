@@ -91,6 +91,27 @@ If a discharge hold would require a minimum above the desired or last acknowledg
 *   **EMS Grid Protection** *(Configuration category)*: Dynamically adjusts charge power every poll cycle to keep all three grid phase currents below the configured fuse size. See below for details.
 *   **I/O Output 1–4** *(disabled by default)*: Direct on/off control of the inverter's I/O board outputs (registers `608`–`611`). Writes `1` when turned on and `0` when turned off, and restores its last state after a Home Assistant restart.
 
+The **Discharge Hold Mode** diagnostic sensor is enabled by default. It shows the
+selected local method: `inactive`, `minimum_soc` (1042), or `discharge_limit`
+(1040). Its attributes explain `reason`, `automatic_fallback`, `hold_owner`,
+`hold_target_soc`, the requested minimum/maximum and last acknowledged maximum
+SoC. `above_requested_max_soc` means the minimum required for the hold exceeds
+the desired maximum; `above_acknowledged_max_soc` means it exceeds the maximum
+last successfully written, for example after a failed maximum increase.
+Until the first acknowledged maximum write, that value is the startup baseline
+of 100%, relying on the startup write pause to let an old external limit expire.
+`configured_discharge_limit` identifies the explicit 1040 option.
+
+This sensor describes control intent, not a confirmed physical block. In 1040
+mode, `standby_discharge_possible` flags the known possibility of battery draw
+for inverter consumption. `control_ready` reports fresh usable inputs outside
+the settling pause, not an acknowledgement of a hold write. The
+`observed_min_soc` and `observed_discharge_limit_w` attributes come from the last
+usable poll and become null when its control data is unusable or stale. They can
+lag a command. Changes appear on coordinator updates (normally every 15 seconds),
+and local intent remains visible during outages. An inactive local hold does not
+prove that a previous inverter command has already expired.
+
 Each control switch exposes `faulted`, `resume_pending`, `loop_running` and `auto_resume_enabled` as attributes, which is the quickest way to see what a switch is doing.
 
 ### Communication Loss and Bounded Charging

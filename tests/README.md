@@ -27,3 +27,17 @@ restore and removal hooks, startup write suppression, post-settle writes and
 timer/task cleanup. Modbus is mocked and standalone entities omit device
 association. It does not certify full integration setup/reload, device registry
 association, real-time timer dispatch or physical inverter timeout behavior.
+
+`test_restart_measurements.py` replays hypothetical Modbus samples based on a
+short 0%/Off → 82%/GridPreCheck observation from the separate HA REST
+integration. It is not a device capture. The cases verify startup/restored-limit
+silence, reconnect behavior with/without automatic resume, and rejection of a
+partial failed poll. Genuine 0% remains valid after settling; there is no general
+SoC-jump detector or inverter-state whitelist. The protection demonstrated here
+is the existing startup/active-control fault pause, not rejection of every
+transient zero. The pause starts at startup/loss, not at recovery: after a long
+outage, an initial numerically valid zero is still accepted with opt-in resume. An outage with only SoC numbers active does not independently
+start a new pause.
+
+`test_hold_diagnostics.py` exercises control-driven hold method transitions,
+failed maximum acknowledgements, explicit 1040 selection and stale observations.
