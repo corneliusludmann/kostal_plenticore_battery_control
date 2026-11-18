@@ -185,6 +185,7 @@ async def test_queued_writer_cannot_observe_unapplied_maximum_increase(data, has
 
 async def test_failed_maximum_increase_keeps_hold_on_1040_until_acknowledged(data, hass):
     healthy(data)
+    data.auto_resume_on_recovery = True
     maximum = KostalMaxSocLimitNumber(data, 'test'); maximum.hass = hass
     await maximum.async_set_native_value(50)
     block = KostalBlockDischargeSwitch(data, 'test'); block.hass = hass; block._attr_is_on = True
@@ -195,9 +196,14 @@ async def test_failed_maximum_increase_keeps_hold_on_1040_until_acknowledged(dat
     data.handler.write_float.side_effect = refuse_maximum
     await maximum.async_set_native_value(90)
     assert data.max_soc == 90 and data.applied_max_soc == 50
+    assert block._resume_pending
+    assert data.control_settling()
     data.mark_communication_restored()
     data.handler.write_float.side_effect = None
     data.handler.write_float.reset_mock()
+    await block._async_handle_loop_tick()
+    data.handler.write_float.assert_not_awaited()
+    data.last_stop_time = 0  # Opt-in recovery still waits for inverter settling.
     await block._async_handle_loop_tick()
     writes = [c.args for c in data.handler.write_float.await_args_list]
     assert (1040, 0) in writes

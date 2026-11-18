@@ -2,6 +2,8 @@
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from custom_components.kostal_modbus_control.const import (
     REG_BATTERY_SOC, REG_BATTERY_MIN_SOC, REG_BATTERY_MAX_DISCHARGE_POWER_W,
     REG_BATTERY_MAX_DISCHARGE_LIMIT,
@@ -46,15 +48,22 @@ async def test_hold_diagnostic_follows_limit_transitions_and_stop(data, hass):
     await maximum.async_will_remove_from_hass()
 
 
-async def test_failed_max_raise_explains_acknowledgement_fallback(data, hass):
+@pytest.mark.parametrize('auto_resume', [False, True])
+async def test_failed_max_raise_explains_acknowledgement_fallback(data, hass, auto_resume):
+    data.auto_resume_on_recovery = auto_resume
     hold, sensor = setup(data, hass)
     data.max_soc = data.applied_max_soc = 50
     await hold._run_guarded_action(hold._hold_discharge_at, 'test', 80)
     maximum = KostalMaxSocLimitNumber(data, 'test'); maximum.hass = hass
     data.handler.write_float.side_effect = ConnectionError('test')
     await maximum.async_set_native_value(90)
-    assert sensor.native_value == 'discharge_limit'
-    assert sensor.extra_state_attributes['reason'] == 'above_acknowledged_max_soc'
+    assert hold.is_on is auto_resume
+    assert hold._faulted
+    assert not sensor.extra_state_attributes['control_ready']
+    assert sensor.native_value == ('discharge_limit' if auto_resume else 'inactive')
+    assert sensor.extra_state_attributes['reason'] == (
+        'above_acknowledged_max_soc' if auto_resume else 'no_hold'
+    )
     assert sensor.extra_state_attributes['acknowledged_max_soc'] == 50
     await maximum.async_will_remove_from_hass()
 

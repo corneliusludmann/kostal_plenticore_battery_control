@@ -22,6 +22,9 @@ inverter behavior remain outside this validation; no inverter deployment occurre
   used conservatively; slow optional reads cannot make old samples appear new.
 - A failed coordinator poll immediately revokes active control permission,
   even if the failure occurs between two write ticks.
+- Failed minimum/maximum SoC writes revoke active sessions through the same
+  recovery policy. A successful poll alone cannot restart charging with recovery
+  disabled; opt-in recovery still waits for the inverter settling interval.
 - Grid control rejects absent, nonfinite, future-dated and stale external
   measurements. An unchanged but still fresh value can retain a setpoint.
   The maximum age is checked again before transmission.
