@@ -215,3 +215,24 @@ def test_upstream_sunspec_estimate_preserves_explicit_fork_ceiling(data):
     assert data.max_battery_power_step_w() == 8550
     data.max_control_power_w = None
     assert data.max_battery_power() == (13500, MAX_POWER_SOURCE_SUNSPEC)
+
+
+async def test_sunspec_sentinel_keeps_learned_fallback_and_recovers(data, hass):
+    from custom_components.kostal_modbus_control.const import (
+        KEY_BATTERY_MAX_VOLTAGE_SUNSPEC, MAX_POWER_SOURCE_SUNSPEC,
+    )
+    coordinator = KostalCoordinator(hass, data.handler, data, 'unused.invalid')
+    coordinator._sunspec_battery_model_address = 40416
+    data.handler.read_uint16 = AsyncMock(return_value=0xffff)
+    data.handler.read_int16 = AsyncMock(return_value=-2)
+    data.coordinator = coordinator
+    data.battery_max_voltage_learned = 420
+    coordinator.data = {REG_SOFTWARE_VERSION: '3.07.10.27989'}
+    coordinator.data[KEY_BATTERY_MAX_VOLTAGE_SUNSPEC] = await coordinator._async_read_sunspec_battery_max_voltage()
+    assert coordinator.data[KEY_BATTERY_MAX_VOLTAGE_SUNSPEC] is None
+    assert data.max_battery_power() == (12600, MAX_POWER_SOURCE_LEARNED)
+    # A temporarily unavailable value must be retried without reconnecting.
+    data.handler.read_uint16.return_value = 45000
+    coordinator.data[KEY_BATTERY_MAX_VOLTAGE_SUNSPEC] = await coordinator._async_read_sunspec_battery_max_voltage()
+    assert coordinator.data[KEY_BATTERY_MAX_VOLTAGE_SUNSPEC] == 450
+    assert data.max_battery_power() == (13500, MAX_POWER_SOURCE_SUNSPEC)

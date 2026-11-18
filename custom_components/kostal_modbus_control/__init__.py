@@ -223,7 +223,9 @@ class KostalCoordinator(DataUpdateCoordinator[dict[Any, Any]]):
         first_point = self._sunspec_battery_model_address + 2
         raw = await self._handler.read_uint16(first_point + SUNSPEC_BATTERY_VMAX_OFFSET)
         scale = await self._handler.read_int16(first_point + SUNSPEC_BATTERY_V_SF_OFFSET)
-        if not -10 <= scale <= 10:
+        # SunSpec's uint16 not-implemented sentinel can scale into the valid
+        # voltage range (65535 * 0.01 = 655.35 V). Reject it before scaling.
+        if raw == 0xFFFF or not -10 <= scale <= 10:
             return None
         voltage = round(raw * 10.0**scale, 3)
         return voltage if BATTERY_MAX_VOLTAGE_RANGE[0] <= voltage <= BATTERY_MAX_VOLTAGE_RANGE[1] else None
