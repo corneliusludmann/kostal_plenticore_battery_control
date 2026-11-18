@@ -62,6 +62,8 @@ class Coordinator:
         self.hass = hass
         self.data = None
         self.last_update_success = True
+    async def async_shutdown(self):
+        pass
     def async_add_listener(self, callback):
         return lambda: None
 

@@ -148,7 +148,10 @@ class KostalPowerRateNumber(RestoreNumber):
             self._set_fixed(None)
         else:
             try:
-                self._set_fixed(_finite_in_range(last_number.native_value, 0, self.native_max_value))
+                # A learned maximum or a temporary BMS derating may be lower
+                # than when the user saved this value. Preserve the fixed
+                # request; control writes clamp it to the current maximum.
+                self._set_fixed(_finite_in_range(last_number.native_value, 0, math.inf))
             except (TypeError, ValueError):
                 _LOGGER.warning("Ignoring invalid restored power rate; using zero W")
                 self._set_fixed(0.0)

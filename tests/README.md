@@ -41,3 +41,16 @@ start a new pause.
 
 `test_hold_diagnostics.py` exercises control-driven hold method transitions,
 failed maximum acknowledgements, explicit 1040 selection and stale observations.
+
+## Fixed-power restore and coordinator shutdown
+
+`test_restore_and_poll_shutdown.py` covers retained fixed charge/discharge
+requests when learning a lower hybrid maximum or after BMS derating, invalid
+restored values, cancellation during inverter/KSEM reads, blocked refreshes after
+unload, and continued polling if platform unload fails. Control writes still
+clamp retained requests to the current maximum; new user input remains bounded.
+
+Run `python tools/ha_poll_shutdown_smoke.py` in the separate real-HA environment
+to check an in-flight `async_refresh` through successful entry unload and repeated
+shutdown. It uses the real coordinator and Modbus locking with an in-memory
+transport; platform unload is mocked successful. No live services are accessed.

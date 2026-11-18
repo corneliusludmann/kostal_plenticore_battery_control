@@ -347,6 +347,7 @@ async def test_unload_entry_revokes_queued_action_before_platform_teardown(data,
         await release.wait()
         await switch.async_will_remove_from_hass()
         return True
+    data.coordinator.async_shutdown = AsyncMock()
     hass.config_entries = SimpleNamespace(async_unload_platforms=unload_platforms)
     hass.data = {DOMAIN: {'test': data}}
     await data.control_lock.acquire()
