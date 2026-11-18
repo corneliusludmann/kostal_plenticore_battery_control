@@ -155,6 +155,8 @@ async def smoke(config_dir: str) -> None:
     assert state.state == "inactive"
     assert state.attributes["device_class"] == "enum"
     assert state.attributes["options"] == ["inactive", "minimum_soc", "discharge_limit"]
+    assert data.hold_use_discharge_limit  # Upstream 4.2.0 default.
+    data.hold_use_discharge_limit = False  # Exercise the explicit legacy-mode fallback.
     data.discharge_hold_min_soc = 90
     coordinator.async_set_updated_data({1040: 0, 1042: 20})
     state = hass.states.get(diagnostic.entity_id)
@@ -162,6 +164,13 @@ async def smoke(config_dir: str) -> None:
     assert state.attributes["automatic_fallback"]
     assert state.attributes["reason"] == "above_requested_max_soc"
     assert state.attributes["observed_discharge_limit_w"] == 0
+    data.hold_use_discharge_limit = True
+    data.discharge_limit_guard_soc = 80
+    for current_soc in (79, 76, 10, 78):
+        coordinator.async_set_updated_data({210: current_soc, 1040: 0, 1042: 20})
+        state = hass.states.get(diagnostic.entity_id)
+        assert state.attributes["minimum_soc_guard_active"]
+        assert state.attributes["guard_min_soc"] == max(data.min_soc, current_soc)
     data.communication_ok = False
     coordinator.async_set_update_error(ConnectionError("smoke outage"))
     state = hass.states.get(diagnostic.entity_id)
