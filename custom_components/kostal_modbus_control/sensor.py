@@ -319,6 +319,9 @@ class KostalDischargeHoldModeSensor(KostalBaseSensor):
             "acknowledged_max_soc": data.applied_max_soc,
             "control_ready": fresh and not data.control_settling(),
             "standby_discharge_possible": mode == "discharge_limit",
+            "minimum_soc_guard_active": mode == "discharge_limit" and data.discharge_limit_guard_soc is not None,
+            "guard_min_soc": (data.effective_min_soc()
+                              if mode == "discharge_limit" and data.discharge_limit_guard_soc is not None else None),
             "observed_min_soc": observed.get(REG_BATTERY_MIN_SOC),
             "observed_discharge_limit_w": observed.get(REG_BATTERY_MAX_DISCHARGE_POWER_W),
         }

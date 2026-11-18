@@ -66,6 +66,7 @@ async def test_reconnect_zero_does_not_replay_control_during_quiet_period(
     data, hass, switch_type, auto_resume,
 ):
     data.auto_resume_on_recovery = auto_resume
+    data.hold_use_discharge_limit = False
     data.inverter_max_power_w = 6000
     data.charge_power_fixed_w = 1000
     _sample, poll = replay(data, hass)

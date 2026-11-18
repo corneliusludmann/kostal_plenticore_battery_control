@@ -67,3 +67,13 @@ manual override validation/apply/clear, fixed-power clamping and ambiguous model
 IDs. Values such as 100 with exponent 2 are synthetic test cases, not a capture
 of a user's register 532. Real-HA `ha_smoke.py` also checks the new optional
 selector and clearing a saved override. No hardware writes are part of these tests.
+
+## Residual-discharge guard after upstream 4.2.0 rebase
+
+`test_discharge_limit_guard.py` exercises actual switch, number and option-change
+paths: sustained detection, downward/upward tracking, configured minimum floor,
+o offset on the guard, minimum-writer interleavings, invalid/stale inputs,
+acknowledged-maximum ordering, stop/fault cleanup, ownership and mode changes.
+Legacy register-transition tests explicitly select minimum-SOC mode because
+upstream now defaults to 1040. These tests prove software register sequences,
+not avoidance of maintenance charging or full discharge blocking on hardware.

@@ -198,3 +198,20 @@ async def test_new_override_never_discards_explicit_directional_caps(data, hass,
     empty = form['data_schema']({})
     assert CONF_EXTERNAL_CONTROL_MAX_CHARGE_W not in empty
     assert CONF_EXTERNAL_CONTROL_MAX_DISCHARGE_W not in empty
+
+
+def test_upstream_sunspec_estimate_preserves_explicit_fork_ceiling(data):
+    from custom_components.kostal_modbus_control.const import (
+        KEY_BATTERY_MAX_VOLTAGE_SUNSPEC, MAX_POWER_SOURCE_SUNSPEC,
+    )
+    data.coordinator = SimpleNamespace(data={
+        REG_SOFTWARE_VERSION: '3.07.10.27989', KEY_BATTERY_MAX_VOLTAGE_SUNSPEC: 450,
+    })
+    data.inverter_max_power_w = 100  # Restricted feed-in reading must not override SunSpec.
+    data.battery_max_voltage_learned = 420
+    assert data.max_battery_power() == (13500, MAX_POWER_SOURCE_SUNSPEC)
+    data.max_control_power_w = 8550
+    assert data.max_battery_power() == (8550, MAX_POWER_SOURCE_CONFIGURED)
+    assert data.max_battery_power_step_w() == 8550
+    data.max_control_power_w = None
+    assert data.max_battery_power() == (13500, MAX_POWER_SOURCE_SUNSPEC)

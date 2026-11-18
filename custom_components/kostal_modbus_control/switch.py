@@ -405,6 +405,7 @@ class KostalBaseSwitch(SwitchEntity):
         if self._data.discharge_hold_owner == self._key:
             self._data.discharge_hold_min_soc = None
             self._data.discharge_hold_owner = None
+            self._data.clear_discharge_limit_guard()
 
     async def _async_handle_loop_tick(self, *args) -> None:
         if not self._attr_is_on:

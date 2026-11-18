@@ -14,6 +14,7 @@ from custom_components.kostal_modbus_control.switch import KostalBlockDischargeS
 
 
 def setup(data, hass):
+    data.hold_use_discharge_limit = False
     data.control_values_valid = True
     data.last_control_update = time.monotonic()
     data.coordinator = SimpleNamespace(data={REG_BATTERY_SOC: 80,

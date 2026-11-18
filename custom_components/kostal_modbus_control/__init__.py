@@ -785,17 +785,37 @@ class KostalData:
         )
 
     def effective_min_soc(self) -> float:
-        """Min SOC for 1042: the user's limit or a discharge hold, whichever is higher.
+        """Shared 1042 value for holds and number keep-alives.
 
-        A hold on 1040 leaves 1042 to the user's limit, unless its guard is active.
+        A residual-discharge guard follows fresh SoC in both directions. Keep
+        the regular minimum as the floor and never write over an unacknowledged
+        maximum (writers defer when the regular minimum itself is above it).
         """
+        if self.discharge_hold_min_soc is None:
+            return self.min_soc
         if self.hold_uses_discharge_limit():
             if self.discharge_limit_guard_soc is None:
                 return self.min_soc
-            return min(self.max_soc, self.applied_max_soc, max(self.min_soc, self.discharge_limit_guard_soc))
-        if self.discharge_hold_min_soc is None:
-            return self.min_soc
+            # The number timer may run before the next hold tick. It must not
+            # renew the previous guard after a new lower SoC has been polled.
+            data = self.coordinator.data if self.coordinator is not None else None
+            soc = data.get(REG_BATTERY_SOC) if data else None
+            if self.control_data_fresh() and self._valid_guard_soc(soc):
+                self.discharge_limit_guard_soc = soc
+            return max(self.min_soc, min(
+                self.max_soc, self.applied_max_soc, self.discharge_limit_guard_soc
+            ))
         return min(self.max_soc, max(self.min_soc, self.discharge_hold_min_soc))
+
+    @staticmethod
+    def _valid_guard_soc(soc: float | None) -> bool:
+        return (isinstance(soc, (int, float)) and not isinstance(soc, bool)
+                and math.isfinite(soc) and 0 <= soc <= 100)
+
+    def clear_discharge_limit_guard(self) -> None:
+        """Retire local guard intent; the transport may be unavailable."""
+        self.discharge_limit_delivering_since = None
+        self.discharge_limit_guard_soc = None
 
     async def async_restore_discharge_limit(self) -> None:
         """Write the battery's maximum back to 1040 if a hold blocked it, or if it reads as blocked."""
@@ -822,24 +842,23 @@ class KostalData:
     async def async_write_discharge_hold(self, soc_percent: float) -> None:
         """Stop discharging at soc_percent, through 1040 or, with the option off, 1042.
 
-        Since the firmware of October 2026, 1040 = 0 still lets the inverter's own
-        standby draw come from the battery, while a min SOC at or above the SoC stops
-        discharge at 0 A — see _update_limit_guard. 1040 has no SOC of its own, so it
-        is only blocked once the SoC is down at soc_percent. Charging is not affected
+        Some firmware still delivers battery power with 1040 = 0. Add a
+        current-SoC guard when that persists — see _update_limit_guard. 1040 has
+        no SOC of its own, so it is only blocked once SoC is down at soc_percent. Charging is not affected
         either way. Must be written continuously, like every battery register.
         """
         self.discharge_hold_min_soc = soc_percent
         if not self.hold_uses_discharge_limit():
             await self.handler.write_float(REG_BATTERY_MIN_SOC, self.effective_min_soc())
             await self.async_restore_discharge_limit()
+            self.clear_discharge_limit_guard()
             return
         data = self.coordinator.data if self.coordinator is not None else None
         soc = data.get(REG_BATTERY_SOC) if data else None
         if soc is not None and soc > soc_percent:
-            try:
-                await self.async_restore_discharge_limit()
-            finally:
-                await self._async_clear_limit_guard()
+            await self.async_release_discharge_hold()
+            # Keep the reserve target so its next tick can block again.
+            self.discharge_hold_min_soc = soc_percent
             return
         # Before the write, so a failed write is still restored on release
         self.discharge_limit_blocked = True
@@ -854,18 +873,22 @@ class KostalData:
 
         Once active it stays until the hold ends or the SoC is above it, because the
         min SOC then stops the battery and the power reading no longer shows why it
-        was needed. It follows a rising SoC, so PV can charge, and never goes down.
-        It holds the SoC and not the hold's target: a min SOC above the SoC can make
-        the inverter drop out of FeedIn.
+        was needed. Follow SoC down as well as up: blocking active discharge
+        must not request a refill to an old reserve. effective_min_soc applies
+        the regular minimum floor and maximum bounds for every 1042 writer.
         """
-        if self.discharge_limit_guard_soc is not None:
-            if soc is not None:
-                self.discharge_limit_guard_soc = max(self.discharge_limit_guard_soc, soc)
-            return
-        if soc is None or battery_power is None or battery_power <= DISCHARGE_LIMIT_GUARD_POWER_W:
+        if not self.control_data_fresh() or not self._valid_guard_soc(soc):
             self.discharge_limit_delivering_since = None
             return
-        now = time.time()
+        if self.discharge_limit_guard_soc is not None:
+            self.discharge_limit_guard_soc = soc
+            return
+        if (not isinstance(battery_power, (int, float)) or isinstance(battery_power, bool)
+                or not math.isfinite(battery_power)
+                or battery_power <= DISCHARGE_LIMIT_GUARD_POWER_W):
+            self.discharge_limit_delivering_since = None
+            return
+        now = time.monotonic()
         if self.discharge_limit_delivering_since is None:
             self.discharge_limit_delivering_since = now
             return
@@ -877,19 +900,10 @@ class KostalData:
             )
             self.discharge_limit_guard_soc = soc
 
-    async def _async_clear_limit_guard(self) -> None:
-        """End the guard on a 1040 hold and hand 1042 back to the user's limit."""
-        self.discharge_limit_delivering_since = None
-        if self.discharge_limit_guard_soc is None:
-            return
-        self.discharge_limit_guard_soc = None
-        await self.handler.write_float(REG_BATTERY_MIN_SOC, self.effective_min_soc())
-
     async def async_release_discharge_hold(self) -> None:
         """End a discharge hold: restore 1040 and any guard on it, or hand 1042 back."""
         self.discharge_hold_min_soc = None
-        self.discharge_limit_delivering_since = None
-        self.discharge_limit_guard_soc = None
+        self.clear_discharge_limit_guard()
         await self.async_restore_discharge_limit()
         minimum = self.effective_min_soc()
         if minimum <= self.applied_max_soc:
@@ -912,6 +926,7 @@ class KostalData:
         return self.control_settle_remaining() > 0.0
 
     def mark_communication_lost(self, error: str | None) -> None:
+        self.discharge_limit_delivering_since = None
         self.communication_ok = False
         self.last_error = error
 
@@ -1095,8 +1110,7 @@ async def _async_switch_hold_register(data: KostalData, used_limit: bool) -> Non
 async def _async_switch_hold_register_locked(data: KostalData, used_limit: bool) -> None:
     """Move a running hold to the register the option now selects: the new one first, so the hold has no gap."""
     # The next 1040 hold starts over; 1042 is rewritten below or times out
-    data.discharge_limit_delivering_since = None
-    data.discharge_limit_guard_soc = None
+    data.clear_discharge_limit_guard()
     if data.control_settling():
         # A write now would keep a stopped setpoint alive; the old register times out by itself
         return

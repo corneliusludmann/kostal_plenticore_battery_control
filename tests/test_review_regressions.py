@@ -137,6 +137,7 @@ async def test_discharge_hold_above_maximum_uses_1040_without_crossed_soc(data, 
 
 
 async def test_lowering_and_raising_maximum_moves_active_hold_between_registers(data, hass):
+    data.hold_use_discharge_limit = False
     healthy(data)
     maximum = KostalMaxSocLimitNumber(data, 'test'); maximum.hass = hass
     switch = KostalBlockDischargeSwitch(data, 'test'); switch.hass = hass; switch._attr_is_on = True
@@ -155,6 +156,7 @@ async def test_lowering_and_raising_maximum_moves_active_hold_between_registers(
 
 @pytest.mark.parametrize('queued_writer', ['minimum', 'hold'])
 async def test_queued_writer_cannot_observe_unapplied_maximum_increase(data, hass, queued_writer):
+    data.hold_use_discharge_limit = False
     healthy(data)
     minimum = KostalMinSocLimitNumber(data, 'test'); minimum.hass = hass
     maximum = KostalMaxSocLimitNumber(data, 'test'); maximum.hass = hass
