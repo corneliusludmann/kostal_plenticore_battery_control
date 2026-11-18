@@ -2,8 +2,11 @@
 
 Based on upstream 4.1.2 (83e1a23e11dc74c3654c0e9de7eb998faf37c8bb).
 These changes have automated unit/regression tests against actual integration
-modules with explicit Home Assistant and socket boundary doubles. They have not
-been deployed to an inverter or validated in a complete Home Assistant instance.
+modules with explicit Home Assistant and socket boundary doubles. A separate
+smoke test on Home Assistant 2026.11.1 / CPython 3.14.10 verifies real form
+serialization and Number entity restore/removal, startup write suppression and
+timer cleanup. Full integration setup/reload, device association and physical
+inverter behavior remain outside this validation; no inverter deployment occurred.
 
 ## Behavior changes
 
@@ -24,8 +27,9 @@ been deployed to an inverter or validated in a complete Home Assistant instance.
   The maximum age is checked again before transmission.
 - Enabled EMS protection blocks charging when phase-current data or its initial
   computed charge limit is unavailable. It can resume monitoring fresh data.
-- Automatic communication recovery is opt-in, **off by default**. No active
-  control switch is restored after an HA restart. SoC numbers retain their
+- Automatic communication recovery is opt-in, **off by default**. No power-writing
+  control switch is restored after an HA restart. The non-writing EMS monitor
+  retains its enabled state and waits for fresh valid inputs. SoC numbers retain their
   documented restore behavior after pair validation.
 - Every Charge Start session has a monotonic expiry (default 60 minutes).
   Startup waits and communication outages count toward this duration. Recovery
@@ -36,6 +40,20 @@ been deployed to an inverter or validated in a complete Home Assistant instance.
 - Stop is not an emergency disconnect. A packet already sent cannot be recalled;
   the inverter may take its own timeout to resume internal control. Internal
   regulation can then charge or discharge normally.
+
+- Setup/reload starts a timeout-plus-15-second write pause, including restored
+  SoC keepalives. Stop clears locally owned holds even when writes are unsafe;
+  a stopped background reserve hold also starts this pause.
+- Stop writes recheck shutdown and measurement freshness at the transport lock.
+- SoC changes are serialized and maximum acknowledgements tracked. A hold above
+  the desired or acknowledged maximum uses 1040 rather than an invalid minimum.
+  The inverter's standby consumption can remain with this fallback. Failed or
+  delayed maximum increases cannot prematurely release it.
+- Inactive SoC releases remain pending through outages and failed writes.
+- EMS uses measured signed battery power, applies decreases immediately and
+  smooths only increases. Queued charge commands recheck the current ceiling.
+- Losing a previously observed Predbat mode or an active valid target stops
+  charging; it does not become a manual charge session.
 
 ## Configuration
 
@@ -93,3 +111,4 @@ Before deploying, verify the configured timeout, word order, device mode and
 single-writer ownership. Test a small bounded charge, manual stop, expiry,
 communication loss/recovery and HA restart on the actual installation. This
 repository change alone does not authorize or perform those operations.
+

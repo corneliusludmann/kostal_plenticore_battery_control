@@ -5,3 +5,4 @@ pytest-cov>=6,<8
 aiohttp>=3.11,<4
 pymodbus>=3.6,<4
 voluptuous>=0.15,<1
+voluptuous-serialize>=2.6,<3

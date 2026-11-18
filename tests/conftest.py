@@ -125,7 +125,7 @@ module('homeassistant.helpers.update_coordinator', DataUpdateCoordinator=Coordin
 module('homeassistant.helpers.selector', BooleanSelector=Selector, EntitySelector=Selector,
        EntitySelectorConfig=dict, NumberSelector=Selector, NumberSelectorConfig=dict,
        NumberSelectorMode=SimpleNamespace(BOX='box'), SelectSelector=Selector,
-       SelectSelectorConfig=dict, SelectSelectorMode=SimpleNamespace(DROPDOWN='dropdown'))
+       SelectSelectorConfig=dict, SelectSelectorMode=SimpleNamespace(DROPDOWN='dropdown', LIST='list'))
 module('homeassistant.util')
 module('homeassistant.util.dt', utcnow=lambda: datetime.now(timezone.utc),
        now=lambda: datetime.now(timezone.utc))
@@ -144,4 +144,6 @@ def data():
     from custom_components.kostal_modbus_control import KostalData
     handler = SimpleNamespace(write_float=AsyncMock(), close=AsyncMock(),
                               read_int16=AsyncMock(return_value=0))
-    return KostalData(handler=handler, soc_limits_ready=True)
+    # Most unit tests start in an established session. Startup silence is
+    # exercised separately with a freshly constructed production KostalData.
+    return KostalData(handler=handler, soc_limits_ready=True, last_stop_time=0)
