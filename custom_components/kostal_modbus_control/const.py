@@ -5,6 +5,7 @@ CONF_PORT = "port"
 CONF_UNIT_ID = "unit_id"
 CONF_MODBUS_TIMEOUT = "modbus_timeout"  # The configured timeout on the inverter
 CONF_INVERTER_TYPE = "inverter_type"
+CONF_MAX_CONTROL_POWER_W = "max_control_power_w"
 INVERTER_TYPE_HYBRID = "hybrid"
 INVERTER_TYPE_BI = "bi"
 
@@ -17,7 +18,8 @@ REG_MODBUS_BYTE_ORDER = 5        # Modbus byte order - U16 (0x05) 0=little-endia
 REG_MANUFACTURER = 535        # Inverter Manufacturer (String 16)
 REG_MODEL = 768               # Productname (String 32)
 REG_POWER_CLASS = 800         # Power class e.g. "10" (String 32). "7.0" on a G1, "L G3" on a G3
-REG_INVERTER_MAX_POWER = 531  # Inverter max power (W) - U16 (0x213). 6999 on a G1 7.0, 15000 on a G3 L 15 kW
+REG_INVERTER_MAX_POWER = 531  # U16 mantissa; apply the signed factor in 532
+REG_INVERTER_MAX_POWER_SCALE = 532  # S16 decimal exponent, documented range -10..10
 REG_SERIAL = 559              # Inverter Serial Number (String 16)
 REG_SOFTWARE_VERSION = 58     # Overall software version (UI / SW) - String 13 (0x3A)
 SOFTWARE_VERSION_LENGTH = 13  # Registers, per the Kostal register table
@@ -49,10 +51,9 @@ REG_BATTERY_MAX_SOC = 1044        # Maximum SOC % - Float (0x414) RW
 # from SunSpec model 802 (VMax) when the inverter reports it. Otherwise it is
 # learned as the highest battery voltage seen at a state of charge of at least
 # BATTERY_FULL_SOC, and kept across restarts.
-# Until then the inverter max power (register 531) is used — the power class
-# is not a number on a G3. A limit that is too high is harmless, as the
-# inverter clamps a setpoint above its limit itself, while one that is too low
-# locks the user out.
+# Until then the scaled inverter maximum (531 * 10**532) is used. This can
+# reflect a feed-in restriction, not a nameplate rating. An explicit optional
+# control ceiling takes precedence over all estimates.
 BATTERY_FULL_SOC = 99.0
 # SunSpec models follow each other from the base address. Where a model starts
 # differs between inverters (a G1 has no model 203), so the list is walked.
@@ -71,6 +72,7 @@ KEY_BATTERY_MAX_VOLTAGE_SUNSPEC = "battery_max_voltage_sunspec"
 # What the maximum battery control power is based on, shown by the
 # Battery Max Control Power Source sensor
 MAX_POWER_SOURCE_SUNSPEC = "Reported by the inverter (SunSpec)"
+MAX_POWER_SOURCE_CONFIGURED = "Configured maximum"
 MAX_POWER_SOURCE_LEARNED = "Learned after full charge"
 MAX_POWER_SOURCE_INVERTER_MAX_POWER = "Inverter max power (waiting for full charge)"
 MAX_POWER_SOURCE_BATTERY_VOLTAGE = "Battery voltage (waiting for full charge)"
@@ -192,19 +194,8 @@ BATTERY_TYPE_MAP = {
 
 BATTERY_TYPE_BYD = 0x0004
 
-# Battery Model ID (register 525) decoded for BYD packs
-BYD_MODEL_MAP = {
-    1: "HVS 5.1",
-    2: "HVS 7.7",
-    3: "HVS 10.2",
-    4: "HVS 12.8",
-    5: "HVM 8.3",
-    6: "HVM 11.0",
-    7: "HVM 13.8",
-    8: "HVM 16.6",
-    9: "HVM 19.3",
-    10: "HVM 22.1",
-}
+# Register 525 has no verified manufacturer/firmware-specific model-name map.
+# In particular, ID 4 also occurs on HVS+ 10.2; do not infer an HVS capacity.
 
 # Entity descriptions (Sensors)
 SENSOR_BATTERY_SOC = "battery_soc"

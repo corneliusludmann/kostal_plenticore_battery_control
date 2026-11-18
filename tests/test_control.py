@@ -255,6 +255,7 @@ async def test_coordinator_only_marks_usable_control_values_fresh(data, hass, so
     values = {REG_BATTERY_SOC: soc, REG_BATTERY_POWER: power, REG_BATTERY_MGMT_MODE: mode}
     # All other registers are optional and may be missing without stopping reads.
     data.handler.read_float = AsyncMock(side_effect=lambda address: values.get(address))
+    data.handler.read_uint16_scale_pair = AsyncMock(return_value=(1000, 0))
     data.handler.read_int16 = AsyncMock(side_effect=lambda address: values.get(address))
     data.handler.read_uint8 = AsyncMock(side_effect=lambda address: values.get(address))
     for name in ('read_uint16', 'read_uint32', 'read_uint32_big_endian', 'read_string'):

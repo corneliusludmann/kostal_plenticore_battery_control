@@ -99,8 +99,6 @@ from .const import (
     SENSOR_SOFTWARE_VERSION,
     SENSOR_BATTERY_MODEL_ID,
     SENSOR_BATTERY_MODEL_ID_TEXT,
-    BATTERY_TYPE_BYD,
-    BYD_MODEL_MAP,
     SENSOR_BATTERY_GROSS_CAPACITY,
     SENSOR_BATTERY_CYCLES,
     SENSOR_BATTERY_CURRENT,
@@ -405,6 +403,10 @@ class KostalBatteryMaxControlPowerSensor(KostalBaseSensor):
             "battery_max_voltage_reported": round(reported_voltage, 1) if reported_voltage is not None else None,
             "battery_max_voltage_learned": round(learned_voltage, 1) if learned_voltage is not None else None,
             "max_voltage_known": max_voltage is not None,
+            "configured_max_control_power_w": self._data.max_control_power_w,
+            "inverter_max_power_raw": self._data.inverter_max_power_raw,
+            "inverter_max_power_scale": self._data.inverter_max_power_scale,
+            "inverter_max_power_w": self._data.inverter_max_power_w,
         }
 
 
@@ -1020,10 +1022,18 @@ class KostalBatteryModelIdTextSensor(KostalBaseSensor):
         val = self.coordinator.data.get(self._data_key)
         if val is None:
             return None
-        # The model ID numbering is only known for BYD packs
-        if self.coordinator.data.get(REG_BATTERY_TYPE) != BATTERY_TYPE_BYD:
-            return f"Unknown ({val})"
-        return BYD_MODEL_MAP.get(val, f"Unknown ({val})")
+        # The manufacturer does not document a reliable model-name mapping.
+        # Preserve the entity, but do not turn an ambiguous ID into a capacity.
+        battery_type = BATTERY_TYPE_MAP.get(self.coordinator.data.get(REG_BATTERY_TYPE))
+        return f"{battery_type or 'Unknown battery'} (model ID {val})"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        readings = self.coordinator.data or {}
+        return {
+            "model_id": readings.get(REG_BATTERY_MODEL_ID),
+            "model_name_verified": False,
+        }
 
 
 class KostalBatteryGrossCapacitySensor(KostalBaseSensor):

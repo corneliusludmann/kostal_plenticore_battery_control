@@ -37,6 +37,7 @@ from .const import (
     REG_MODEL,
     REG_POWER_CLASS,
     REG_INVERTER_MAX_POWER,
+    REG_INVERTER_MAX_POWER_SCALE,
     REG_TOTAL_ACTIVE_POWER,
     REG_VOLTAGE_PHASE1,
     REG_VOLTAGE_PHASE2,
@@ -72,6 +73,8 @@ from .const import (
     STORAGE_VERSION,
     STORAGE_SAVE_DELAY_SECONDS,
     CONF_INVERTER_TYPE,
+    CONF_MAX_CONTROL_POWER_W,
+    MAX_POWER_SOURCE_CONFIGURED,
     INVERTER_TYPE_BI,
     REG_BATTERY_WORK_CAPACITY,
     REG_BATTERY_MGMT_MODE,
@@ -392,6 +395,13 @@ class KostalCoordinator(DataUpdateCoordinator[dict[Any, Any]]):
                     "the SunSpec battery model",
                     self._async_read_sunspec_battery_max_voltage,
                 )
+            power_pair = await self._read_optional(
+                REG_INVERTER_MAX_POWER,
+                "inverter max power and scale factor (531/532)",
+                partial(self._handler.read_uint16_scale_pair, REG_INVERTER_MAX_POWER),
+            )
+            data[REG_INVERTER_MAX_POWER] = power_pair[0] if power_pair is not None else None
+            data[REG_INVERTER_MAX_POWER_SCALE] = power_pair[1] if power_pair is not None else None
             self._kostal_data.update_observed_battery_current(data)
             # KSEM energy registers (separate handler, optional)
             ksem = self._kostal_data.ksem_handler
@@ -428,6 +438,7 @@ class KostalCoordinator(DataUpdateCoordinator[dict[Any, Any]]):
                     except Exception as err:
                         _LOGGER.debug("Failed to read %s: %s", label, err)
                         data[reg] = None
+            self._kostal_data.update_inverter_max_power(power_pair)
             self._kostal_data.last_control_update = poll_started
             self._kostal_data.control_values_valid = (
                 all(isinstance(data.get(reg), (int, float)) and math.isfinite(data[reg])
@@ -466,8 +477,11 @@ class KostalData:
     predbat_status: str = "Inactive"
     inverter_model: str = ""
     inverter_power_class: str = ""
-    # Inverter max power (531) in W, None when the inverter lacks it
+    # Scaled 531/532 reading, refreshed each successful poll (not a nameplate).
     inverter_max_power_w: float | None = None
+    max_control_power_w: float | None = None
+    inverter_max_power_raw: int | None = None
+    inverter_max_power_scale: int | None = None
     # Absolute power setpoint register: 1034 (DC) for hybrid, 1026 (AC) for BI
     charge_discharge_reg: int = REG_BATTERY_DC_POWER_SETPOINT_W
     # Highest 1078 / battery voltage and highest battery voltage seen, and the
@@ -645,15 +659,29 @@ class KostalData:
         documented = self.documented_battery_nominal_current()
         return documented if documented is not None else self.battery_nominal_current_observed
 
+    def update_inverter_max_power(self, pair: tuple[int, int] | None) -> None:
+        """Never use a missing/sentinel scale as if it meant unscaled Watts."""
+        raw, scale = pair if pair is not None else (None, None)
+        self.inverter_max_power_raw = raw
+        self.inverter_max_power_scale = scale
+        self.inverter_max_power_w = None
+        if (type(raw) is not int or not 0 < raw < 0xFFFF
+                or type(scale) is not int or not -10 <= scale <= 10):
+            return
+        self.inverter_max_power_w = float(raw * 10 ** scale)
+
     def max_battery_power(self) -> tuple[float | None, str | None]:
         """Maximum battery control power in Watts and what it is based on.
 
-        Hybrid: the nominal battery current times the battery's maximum voltage,
-        reported through SunSpec or else learned at a full charge. Until it is
-        learned the inverter max power (531), or the current times the highest
-        battery voltage seen when 531 is unknown. BI: the nominal AC power from the power class, or the battery's
-        discharge limit 1078 when the power class is unknown.
+        Hybrid: nominal battery current times the maximum battery voltage,
+        reported through SunSpec or learned at full charge. Until then use the
+        inverter maximum (531 scaled by 532), or current times the highest
+        voltage seen if the pair is unusable. BI: nominal AC power from the
+        power class, or battery discharge limit 1078 if the class is unknown.
+        An explicitly configured ceiling takes precedence over all estimates.
         """
+        if self.max_control_power_w is not None:
+            return self.max_control_power_w, MAX_POWER_SOURCE_CONFIGURED
         data = self.coordinator.data if self.coordinator is not None else None
         if data is None:
             return None, None
@@ -712,6 +740,9 @@ class KostalData:
         max_power = self.max_battery_power_w()
         if max_power is None:
             return None
+        # An explicit ceiling must never be rounded up beyond the user's limit.
+        if self.max_control_power_w is not None:
+            return max_power
         return math.ceil(max_power / POWER_RATE_STEP_W) * POWER_RATE_STEP_W
 
     def charge_power_w(self) -> float:
@@ -955,12 +986,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     inverter_power_class = await _read_optional_at_setup(
         partial(handler.read_string, REG_POWER_CLASS, 16), "the power class register"
     ) or ""
-    inverter_max_power_w = await _read_optional_at_setup(
-        partial(handler.read_uint16, REG_INVERTER_MAX_POWER), "the inverter max power register"
-    )
-    _LOGGER.info(
-        "Inverter model=%r power_class=%r max_power=%s W", inverter_model, inverter_power_class, inverter_max_power_w
-    )
+    _LOGGER.info("Inverter model=%r power_class=%r", inverter_model, inverter_power_class)
 
     battery_type_raw = await _read_optional_at_setup(
         partial(handler.read_uint16, REG_BATTERY_TYPE), "the battery type register"
@@ -1007,7 +1033,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         inverter_timeout=timeout,
         inverter_model=inverter_model,
         inverter_power_class=inverter_power_class,
-        inverter_max_power_w=float(inverter_max_power_w) if inverter_max_power_w else None,
         charge_discharge_reg=charge_discharge_reg,
         ksem_handler=ksem_handler,
     )
@@ -1098,6 +1123,8 @@ def _apply_hold_options(options: Any, data: KostalData) -> None:
 
 def _apply_grid_control_options(options: Any, data: KostalData) -> None:
     """Copy the grid control settings from the options to the runtime data."""
+    maximum = options.get(CONF_MAX_CONTROL_POWER_W)
+    data.max_control_power_w = float(maximum) if maximum is not None else None
     new_entity = options.get(CONF_SOURCE_GRID_POWER_ENTITY) or None
     if new_entity != data.source_grid_power_entity:
         # A different source makes the old filtered value meaningless

@@ -92,6 +92,7 @@ async def test_unload_cancels_entire_poll_before_closing_transports(data, hass, 
     if separate_meter:
         data.ksem_handler = handler
         data.handler = AsyncMock()
+        data.handler.read_uint16_scale_pair.return_value = (10000, 0)
         data.handler.read_float.return_value = 50
         data.handler.read_string.return_value = '1.0'
         for method in ('read_int16', 'read_uint8', 'read_uint16', 'read_uint32', 'read_uint32_big_endian'):

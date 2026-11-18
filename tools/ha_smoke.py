@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from unittest.mock import AsyncMock, PropertyMock, patch
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -34,7 +35,7 @@ from homeassistant.helpers.entity_component import EntityComponent
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from custom_components.kostal_modbus_control import KostalData, number, sensor
-from custom_components.kostal_modbus_control.config_flow import ConfigFlow
+from custom_components.kostal_modbus_control.config_flow import ConfigFlow, KostalOptionsFlowHandler
 
 
 async def smoke(config_dir: str) -> None:
@@ -51,6 +52,26 @@ async def smoke(config_dir: str) -> None:
     assert (timeout["valueMin"], timeout["valueMax"], timeout["default"]) == (10, 3600, 30)
     assert len(fields) == 3
     print(f"PASS: real HA {const.__version__} configuration form serialization")
+
+    options_flow = KostalOptionsFlowHandler()
+    options_flow.hass = hass
+    options_flow.context = {"source": "init"}
+    with patch.object(
+        KostalOptionsFlowHandler, "config_entry", new_callable=PropertyMock,
+        return_value=SimpleNamespace(entry_id="smoke", options={"max_control_power_w": 8500}),
+    ):
+        option_form = await options_flow.async_step_init()
+        option_fields = probatio.to_field_list(
+            option_form["data_schema"], custom_serializer=custom_serializer
+        )
+        ceiling = next(field for field in option_fields if field["name"] == "max_control_power_w")
+        assert ceiling["selector"]["number"]["unit_of_measurement"] == "W"
+        assert ceiling["selector"]["number"]["min"] == 100
+        assert ceiling["selector"]["number"]["max"] == 50000
+        assert "max_control_power_w" not in option_form["data_schema"]({})
+        result = await options_flow.async_step_init(option_form["data_schema"]({}))
+        assert "max_control_power_w" not in result["data"]
+    print("PASS: real HA optional power ceiling serialization and clear")
 
     hass.config_entries = ConfigEntries(hass, {})
     hass.config_entries._store.set_load_empty()

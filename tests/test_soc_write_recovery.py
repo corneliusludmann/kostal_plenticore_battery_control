@@ -30,6 +30,7 @@ async def test_soc_write_failure_revokes_charge_before_successful_poll(
         REG_BATTERY_MGMT_MODE: 2,
         REG_BATTERY_MIN_SOC: 5, REG_BATTERY_MAX_SOC: 100,
     }
+    data.handler.read_uint16_scale_pair = AsyncMock(return_value=(6000, 0))
     for name in ('read_float', 'read_int16', 'read_uint8', 'read_uint16',
                  'read_uint32', 'read_uint32_big_endian', 'read_string'):
         setattr(data.handler, name, AsyncMock(

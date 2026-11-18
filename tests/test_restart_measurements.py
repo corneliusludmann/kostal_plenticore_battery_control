@@ -24,6 +24,7 @@ from custom_components.kostal_modbus_control.switch import (
 def replay(data, hass):
     sample = {REG_BATTERY_SOC: 82, REG_BATTERY_POWER: 0,
               REG_BATTERY_MGMT_MODE: 2, REG_INVERTER_STATE: 6}
+    data.handler.read_uint16_scale_pair = AsyncMock(return_value=(6000, 0))
     for name in ('read_float', 'read_int16', 'read_uint8', 'read_uint16',
                  'read_uint32', 'read_uint32_big_endian', 'read_string'):
         setattr(data.handler, name, AsyncMock(side_effect=lambda address, *args: sample.get(address)))
