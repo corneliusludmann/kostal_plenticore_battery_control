@@ -1,0 +1,7 @@
+# Unit tests use explicit HA boundary doubles; no live Home Assistant required.
+pytest>=8.3,<10
+pytest-asyncio>=1.0,<2
+pytest-cov>=6,<8
+aiohttp>=3.11,<4
+pymodbus>=3.6,<4
+voluptuous>=0.15,<1
